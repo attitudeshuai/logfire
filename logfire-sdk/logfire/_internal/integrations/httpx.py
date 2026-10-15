@@ -102,7 +102,7 @@ def _instrumentors_for_installed_modules() -> list[Any]:
     return instrumentors
 
 
-def _instrumentor_for_client(client: Any) -> tuple[Any, bool]:
+def instrumentor_for_client(client: Any) -> tuple[Any, bool]:
     if _httpx is not None and isinstance(client, (_httpx.Client, _httpx.AsyncClient)):
         return HTTPXClientInstrumentor(), isinstance(client, _httpx.AsyncClient)
     if _httpx2 is not None and isinstance(client, (_httpx2.Client, _httpx2.AsyncClient)):
@@ -186,7 +186,7 @@ def instrument_httpx(
         for instrumentor in _instrumentors_for_installed_modules():
             instrumentor.instrument(**final_kwargs)
     else:
-        instrumentor, is_async = _instrumentor_for_client(client)
+        instrumentor, is_async = instrumentor_for_client(client)
         if is_async:
             request_hook = make_async_request_hook(
                 request_hook,

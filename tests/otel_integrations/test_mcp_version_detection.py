@@ -27,8 +27,10 @@ import_module('logfire._internal.integrations.mcp')
 def test_missing_shared_session_means_mcp_2(monkeypatch: pytest.MonkeyPatch):
     # `None` in `sys.modules` makes the import raise `ModuleNotFoundError` with `name='mcp.shared.session'`.
     monkeypatch.setitem(sys.modules, 'mcp.shared.session', None)
-    with pytest.warns(UserWarning, match=r'`logfire\.instrument_mcp\(\)` is unnecessary with mcp 2') as records:
-        logfire.instrument_mcp()
+    # The test suite registers mcp 1 instrumentation at collection time, so allow the repeat call.
+    with logfire.instrumentations.on_duplicate('ignore'):
+        with pytest.warns(UserWarning, match=r'`logfire\.instrument_mcp\(\)` is unnecessary with mcp 2') as records:
+            logfire.instrument_mcp()
     assert len(records) == 1
 
 
@@ -42,5 +44,6 @@ def test_other_import_failures_propagate(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.delitem(sys.modules, 'mcp.shared.session')
     monkeypatch.setattr(sys, 'meta_path', [BrokenDependencyFinder(), *sys.meta_path])
-    with pytest.raises(ModuleNotFoundError, match='some_dependency'):
-        logfire.instrument_mcp()
+    with logfire.instrumentations.on_duplicate('ignore'):
+        with pytest.raises(ModuleNotFoundError, match='some_dependency'):
+            logfire.instrument_mcp()

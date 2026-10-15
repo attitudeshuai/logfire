@@ -339,16 +339,19 @@ def test_runtime(logfire_api_factory: Callable[[], ModuleType], module_name: str
                 logfire_api.instrument_dspy()
     logfire__all__.remove('instrument_dspy')
 
-    for member in [m for m in logfire__all__ if m.startswith('instrument_')]:
-        assert hasattr(logfire_api, member), member
-        if member == 'instrument_monty' and module_name == 'logfire.':
-            # Monty's native instrumentation is process-global and one-shot.
-            pass
-        elif not (pydantic_pre_2_5 and member == 'instrument_pydantic'):
-            # skip pydantic instrumentation (which uses the plugin) for versions prior to v2.5
-            getattr(logfire_api, member)()
-        # just remove the member unconditionally to pass future asserts
-        logfire__all__.remove(member)
+    # This loop only checks that every method exists/calls; repeat calls against the
+    # same process-global targets must not trip the catalog's duplicate-instrumentation warning.
+    with logfire_api.instrumentations.on_duplicate('ignore'):
+        for member in [m for m in logfire__all__ if m.startswith('instrument_')]:
+            assert hasattr(logfire_api, member), member
+            if member == 'instrument_monty' and module_name == 'logfire.':
+                # Monty's native instrumentation is process-global and one-shot.
+                pass
+            elif not (pydantic_pre_2_5 and member == 'instrument_pydantic'):
+                # skip pydantic instrumentation (which uses the plugin) for versions prior to v2.5
+                getattr(logfire_api, member)()
+            # just remove the member unconditionally to pass future asserts
+            logfire__all__.remove(member)
 
     assert hasattr(logfire_api, 'shutdown')
     logfire_api.shutdown()
@@ -424,6 +427,23 @@ def test_runtime(logfire_api_factory: Callable[[], ModuleType], module_name: str
     request = MagicMock(method='GET', headers={})
     asyncio.run(logfire_api.forward_export_request_starlette(request))
     logfire__all__.remove('forward_export_request_starlette')
+
+    # The instrumentation catalog and its types are exercised separately below.
+    assert hasattr(logfire_api, 'instrumentations')
+    catalog = logfire_api.instrumentations
+    assert isinstance(catalog.list(), tuple)
+    assert catalog.is_instrumented('definitely-not-an-instrumented-library-xyz') is False
+    with catalog.on_duplicate('ignore'):
+        catalog.set_duplicate_policy('warn')
+    for member in (
+        'instrumentations',
+        'InstrumentationInfo',
+        'InstrumentationOrigin',
+        'DuplicateInstrumentationError',
+        'InstrumentationNotRevertibleError',
+    ):
+        assert hasattr(logfire_api, member)
+        logfire__all__.discard(member)
 
     # If it's not empty, it means that some of the __all__ members are not tested.
     assert logfire__all__ == set(), logfire__all__

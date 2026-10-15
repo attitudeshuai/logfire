@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Generator, Iterable, Iterator
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -39,7 +39,7 @@ def instrument_llm_provider(
     get_endpoint_config_fn: Callable[[Any], EndpointConfig],
     on_response_fn: OnResponseFn,
     is_async_client_fn: Callable[[type[Any]], bool],
-) -> AbstractContextManager[None]:
+) -> AbstractContextManager[None] | None:
     """Instruments the provided `client` (or clients) with `logfire`.
 
     The `client` argument can be:
@@ -49,24 +49,32 @@ def instrument_llm_provider(
 
     Returns:
         A context manager that will revert the instrumentation when exited.
-            Use of this context manager is optional.
+            Use of this context manager is optional. Returns `None` when the client
+            was already instrumented and nothing was done.
     """
     if isinstance(client, Iterable):
         # Eagerly instrument each client, but only open the returned context managers
         # in another context manager which the user needs to open if they want.
         # Otherwise the garbage collector will close them and uninstrument.
         context_managers = [
-            instrument_llm_provider(
-                logfire,
-                c,
-                suppress_otel,
-                scope_suffix,
-                get_endpoint_config_fn,
-                on_response_fn,
-                is_async_client_fn,
-            )
+            context_manager
             for c in cast('Iterable[Any]', client)
+            if (
+                context_manager := instrument_llm_provider(
+                    logfire,
+                    c,
+                    suppress_otel,
+                    scope_suffix,
+                    get_endpoint_config_fn,
+                    on_response_fn,
+                    is_async_client_fn,
+                )
+            )
+            is not None
         ]
+        # Every client was already instrumented, so there's nothing new to undo.
+        if not context_managers:
+            return None
 
         @contextmanager
         def uninstrument_context():
@@ -79,7 +87,7 @@ def instrument_llm_provider(
 
     if getattr(client, '_is_instrumented_by_logfire', False):
         # Do nothing if already instrumented.
-        return nullcontext()
+        return None
 
     logfire_llm = logfire.with_settings(custom_scope_suffix=scope_suffix.lower(), tags=['LLM'])
 

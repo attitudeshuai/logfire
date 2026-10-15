@@ -91,6 +91,10 @@ except ImportError:
             def __getattr__(self, attr):
                 return MagicMock()  # pragma: no cover
 
+            @property
+            def instrumentations(self) -> Instrumentations:  # forward ref, defined below
+                return instrumentations
+
             def __init__(self, *args, **kwargs) -> None: ...
 
             def span(self, *args, **kwargs) -> LogfireSpan:
@@ -343,3 +347,42 @@ except ImportError:
 
         def attach_context(*args, **kwargs) -> AbstractContextManager[None]:
             return nullcontext()
+
+        class InstrumentationInfo:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class InstrumentationOrigin:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class DuplicateInstrumentationError(RuntimeError):
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class InstrumentationNotRevertibleError(RuntimeError):
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class Instrumentations:
+            """No-op stand-in for the instrumentation catalog provided by the full logfire package."""
+
+            duplicate_policy = 'warn'
+
+            def set_duplicate_policy(self, *args, **kwargs) -> None: ...
+
+            @contextmanager
+            def on_duplicate(self, *args, **kwargs):
+                yield
+
+            def list(self, *args, **kwargs) -> tuple:
+                return ()
+
+            def get(self, *args, **kwargs) -> None:
+                raise LookupError('logfire-api does not register any instrumentation.')
+
+            def is_instrumented(self, *args, **kwargs) -> bool:
+                return False
+
+            def uninstrument(self, *args, **kwargs) -> None: ...
+
+            def uninstrument_all(self, *args, **kwargs) -> tuple:
+                return ()
+
+        instrumentations = Instrumentations()

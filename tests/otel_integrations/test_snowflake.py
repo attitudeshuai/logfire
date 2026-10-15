@@ -12,6 +12,13 @@ import logfire._internal.integrations.snowflake as snowflake_integration
 from logfire._internal.exporters.test import TestExporter
 
 
+@pytest.fixture(autouse=True)
+def allow_repeated_snowflake_instrumentation() -> Any:
+    # These tests deliberately instrument the same connections/modules repeatedly.
+    with logfire.instrumentations.on_duplicate('ignore'):
+        yield
+
+
 class FakeConnection:
     def __init__(self, **kwargs: Any) -> None:
         self.account = kwargs.get('account')

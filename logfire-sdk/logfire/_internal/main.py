@@ -6,8 +6,8 @@ import json
 import math
 import sys
 import warnings
-from collections.abc import Iterable, Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Generator, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from contextvars import Token
 from enum import Enum
 from functools import cached_property, partial
@@ -52,6 +52,16 @@ from .constants import (
 )
 from .formatter import logfire_format, logfire_format_with_magic
 from .instrument import instrument
+from .instrumentation_registry import (
+    RegistrationHandle,
+    any_active,
+    combine_reverts,
+    instrumentation_registration,
+    object_active_probe,
+    otel_active_probe,
+    otel_optional_uninstrument_call,
+    otel_uninstrument_call,
+)
 from .json_encoder import logfire_json_dumps
 from .json_schema import (
     JsonSchemaProperties,
@@ -130,6 +140,7 @@ if TYPE_CHECKING:
     )
     from .config import TemplateMismatchPolicy
     from .forwarding import ForwardExportRequestResponse
+    from .instrumentation_registry import Instrumentations
     from .integrations.asgi import ASGIApp, ASGIInstrumentKwargs
     from .integrations.aws_lambda import LambdaEvent, LambdaHandler
     from .integrations.llm_providers.semconv import SemconvVersion
@@ -998,6 +1009,27 @@ class Logfire:
     def _warn_if_not_initialized_for_instrumentation(self):
         self.config.warn_if_not_initialized('Instrumentation will have no effect')
 
+    @property
+    def instrumentations(self) -> Instrumentations:
+        """The process-wide catalog of active library instrumentation."""
+        from .instrumentation_registry import instrumentations
+
+        return instrumentations
+
+    @contextmanager
+    def _instrumentation(
+        self,
+        library: str,
+        *,
+        target: Any = None,
+        params: dict[str, Any] | None = None,
+        revertible: bool = True,
+    ) -> Generator[RegistrationHandle, None, None]:
+        with instrumentation_registration(
+            library, target=target, params=params, logfire=self, revertible=revertible
+        ) as registration:
+            yield registration
+
     def instrument_surrealdb(
         self, obj: SyncTemplate | AsyncTemplate | type[SyncTemplate] | type[AsyncTemplate] | None = None
     ) -> None:
@@ -1008,10 +1040,12 @@ class Logfire:
                 Pass a connection class to instrument all instances of that class.
                 By default, all connection classes are instrumented.
         """
-        from .integrations.surrealdb import instrument_surrealdb
+        from .integrations.surrealdb import instrument_surrealdb, is_surrealdb_instrumented
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_surrealdb(obj, self)
+        with self._instrumentation('surrealdb', target=obj, revertible=False) as registration:
+            registration.set_active_probe(lambda: is_surrealdb_instrumented(obj))
+            instrument_surrealdb(obj, self)
 
     def instrument_snowflake(
         self,
@@ -1033,10 +1067,19 @@ class Logfire:
                 and a later call with a different value emits a warning.
                 A connection keeps the setting it was instrumented with, even if the module is instrumented later.
         """
-        from .integrations.snowflake import instrument_snowflake
+        from .integrations.snowflake import instrument_snowflake, is_snowflake_instrumented, sf_connector
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_snowflake(self, conn_or_module, capture_parameters)
+        # Passing the module explicitly is equivalent to instrumenting every connection.
+        target = None if conn_or_module is None or conn_or_module is sf_connector else conn_or_module
+        with self._instrumentation(
+            'snowflake',
+            target=target,
+            params={'capture_parameters': capture_parameters},
+            revertible=False,
+        ) as registration:
+            registration.set_active_probe(lambda: is_snowflake_instrumented(conn_or_module))
+            instrument_snowflake(self, conn_or_module, capture_parameters)
 
     def instrument_mcp(self, *, propagate_otel_context: bool = True) -> None:
         """Instrument the [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
@@ -1055,10 +1098,17 @@ class Logfire:
                 Set to False to prevent setting extra fields like `traceparent` on the metadata of requests.
                 Ignored with mcp 2, which always propagates the context.
         """
-        from .integrations.mcp import instrument_mcp
+        from .integrations.mcp import instrument_mcp, is_mcp_instrumented
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_mcp(self, propagate_otel_context)
+        with self._instrumentation(
+            'mcp', params={'propagate_otel_context': propagate_otel_context}, revertible=False
+        ) as registration:
+            if not instrument_mcp(self, propagate_otel_context):
+                # mcp 2 instruments itself; there's nothing of ours to catalog.
+                registration.skip()
+            else:
+                registration.set_active_probe(is_mcp_instrumented)
 
     def instrument_claude_agent_sdk(self) -> AbstractContextManager[None]:
         """Instrument the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
@@ -1076,7 +1126,8 @@ class Logfire:
         from .integrations.claude_agent_sdk import instrument_claude_agent_sdk
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_claude_agent_sdk(self)
+        with self._instrumentation('claude_agent_sdk') as registration:
+            return registration.bind_context_manager(instrument_claude_agent_sdk(self))
 
     def instrument_pydantic(
         self,
@@ -1106,28 +1157,50 @@ class Logfire:
         # Note that unlike most instrument_* methods, we intentionally don't call
         # _warn_if_not_initialized_for_instrumentation, because this method needs to be called early.
 
-        if record != 'off':
-            import pydantic
+        import logfire.integrations.pydantic as pydantic_integration
 
-            if get_version(pydantic.__version__) < get_version('2.5.0'):
-                raise RuntimeError('The Pydantic plugin requires Pydantic 2.5.0 or newer.')
+        with self._instrumentation(
+            'pydantic',
+            params={
+                'record': record,
+                'include': sorted(include if not isinstance(include, str) else [include]),
+                'exclude': sorted(exclude if not isinstance(exclude, str) else [exclude]),
+            },
+        ) as registration:
+            if record == 'off':
+                # The plugin is being (re)configured to disabled, so there's no active instrumentation.
+                registration.skip()
 
-        from logfire.integrations.pydantic import PydanticPlugin, set_pydantic_plugin_config
+            if record != 'off':
+                import pydantic
 
-        if isinstance(include, str):
-            include = {include}
+                if get_version(pydantic.__version__) < get_version('2.5.0'):
+                    raise RuntimeError('The Pydantic plugin requires Pydantic 2.5.0 or newer.')
 
-        if isinstance(exclude, str):
-            exclude = {exclude}
+            from logfire.integrations.pydantic import PydanticPlugin, set_pydantic_plugin_config
 
-        # TODO instrument using this instance, i.e. pass `self` somewhere, rather than always using the global instance
-        set_pydantic_plugin_config(
-            PydanticPlugin(
-                record=record,
-                include=set(include),
-                exclude=set(exclude),
+            if isinstance(include, str):
+                include = {include}
+
+            if isinstance(exclude, str):
+                exclude = {exclude}
+
+            # TODO instrument using this instance, i.e. pass `self` somewhere, rather than always using the global instance
+            set_pydantic_plugin_config(
+                PydanticPlugin(
+                    record=record,
+                    include=set(include),
+                    exclude=set(exclude),
+                )
             )
-        )
+            if record != 'off':
+                registration.set_revert(lambda: set_pydantic_plugin_config(None))
+                registration.set_active_probe(
+                    lambda: (
+                        pydantic_integration._pydantic_plugin_config_value  # pyright: ignore[reportPrivateUsage]
+                        is not None
+                    )
+                )
 
     @overload
     def instrument_pydantic_ai(
@@ -1198,15 +1271,27 @@ class Logfire:
 
         self._warn_if_not_initialized_for_instrumentation()
 
-        return instrument_pydantic_ai(
-            self,
-            obj=obj,
-            event_mode=event_mode,
-            version=version,
-            include_content=include_content,
-            include_binary_content=include_binary_content,
-            **kwargs,
-        )
+        with self._instrumentation(
+            'pydantic_ai',
+            target=obj,
+            params={
+                'include_binary_content': include_binary_content,
+                'include_content': include_content,
+                'version': version,
+                'event_mode': event_mode,
+                **kwargs,
+            },
+            revertible=False,
+        ):
+            return instrument_pydantic_ai(
+                self,
+                obj=obj,
+                event_mode=event_mode,
+                version=version,
+                include_content=include_content,
+                include_binary_content=include_binary_content,
+                **kwargs,
+            )
 
     def instrument_monty(self) -> None:
         """Instrument Pydantic Monty.
@@ -1218,10 +1303,15 @@ class Logfire:
         It records Monty sessions, executed code, inputs, outputs, external calls,
         exceptions, printed text, and pool metrics. Recorded values are subject to Logfire's configured scrubbing.
         """
+        from .integrations import monty as monty_integration
         from .integrations.monty import instrument_monty
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_monty(self)
+        with self._instrumentation('monty', revertible=False) as registration:
+            registration.set_active_probe(
+                lambda: monty_integration._installed  # pyright: ignore[reportPrivateUsage]
+            )
+            instrument_monty(self)
 
     def instrument_fastapi(
         self,
@@ -1286,16 +1376,30 @@ class Logfire:
         from .integrations.fastapi import instrument_fastapi
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_fastapi(
-            self,
-            app,
-            capture_headers=capture_headers,
-            request_attributes_mapper=request_attributes_mapper,
-            excluded_urls=excluded_urls,
-            record_send_receive=record_send_receive,
-            extra_spans=extra_spans,
-            **opentelemetry_kwargs,
-        )
+        with self._instrumentation(
+            'fastapi',
+            target=app,
+            params={
+                'capture_headers': capture_headers,
+                'request_attributes_mapper': request_attributes_mapper is not None,
+                'excluded_urls': excluded_urls,
+                'record_send_receive': record_send_receive,
+                'extra_spans': extra_spans,
+                **opentelemetry_kwargs,
+            },
+        ) as registration:
+            return registration.bind_context_manager(
+                instrument_fastapi(
+                    self,
+                    app,
+                    capture_headers=capture_headers,
+                    request_attributes_mapper=request_attributes_mapper,
+                    excluded_urls=excluded_urls,
+                    record_send_receive=record_send_receive,
+                    extra_spans=extra_spans,
+                    **opentelemetry_kwargs,
+                )
+            )
 
     def instrument_openai(
         self,
@@ -1380,15 +1484,26 @@ class Logfire:
 
         normalized_versions = normalize_versions(version)
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_llm_provider(
-            self,
-            openai_client or (openai.OpenAI, openai.AsyncOpenAI),
-            suppress_other_instrumentation,
-            'OpenAI',
-            partial(get_endpoint_config, version=normalized_versions),
-            partial(on_response, version=normalized_versions),
-            is_async_client,
-        )
+        with self._instrumentation(
+            'openai',
+            target=openai_client,
+            params={'suppress_other_instrumentation': suppress_other_instrumentation, 'version': normalized_versions},
+        ) as registration:
+            targets = openai_client if openai_client is not None else (openai.OpenAI, openai.AsyncOpenAI)
+            context_manager = instrument_llm_provider(
+                self,
+                targets,
+                suppress_other_instrumentation,
+                'OpenAI',
+                partial(get_endpoint_config, version=normalized_versions),
+                partial(on_response, version=normalized_versions),
+                is_async_client,
+            )
+            if context_manager is None:
+                # The client was already instrumented; the duplicate policy (warn/error/ignore) has already acted.
+                registration.skip()
+                return nullcontext()
+            return registration.bind_context_manager(context_manager)
 
     def instrument_openai_agents(self) -> None:
         """Instrument the [`agents`](https://github.com/openai/openai-agents-python) framework from OpenAI.
@@ -1398,9 +1513,13 @@ class Logfire:
         """
         self._warn_if_not_initialized_for_instrumentation()
 
+        from agents.tracing import get_trace_provider
+
         from .integrations.openai_agents import LogfireTraceProviderWrapper
 
-        LogfireTraceProviderWrapper.install(self)
+        with self._instrumentation('openai_agents', revertible=False) as registration:
+            registration.set_active_probe(lambda: isinstance(get_trace_provider(), LogfireTraceProviderWrapper))
+            LogfireTraceProviderWrapper.install(self)
 
     def instrument_anthropic(
         self,
@@ -1487,21 +1606,31 @@ class Logfire:
 
         normalized_versions = normalize_versions(version)
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_llm_provider(
-            self,
-            anthropic_client
-            or (
+        with self._instrumentation(
+            'anthropic',
+            target=anthropic_client,
+            params={'suppress_other_instrumentation': suppress_other_instrumentation, 'version': normalized_versions},
+        ) as registration:
+            targets = anthropic_client or (
                 anthropic.Anthropic,
                 anthropic.AsyncAnthropic,
                 AnthropicBedrock,
                 AsyncAnthropicBedrock,
-            ),
-            suppress_other_instrumentation,
-            'Anthropic',
-            partial(get_endpoint_config, version=normalized_versions),
-            partial(on_response, version=normalized_versions),
-            is_async_client,
-        )
+            )
+            context_manager = instrument_llm_provider(
+                self,
+                targets,
+                suppress_other_instrumentation,
+                'Anthropic',
+                partial(get_endpoint_config, version=normalized_versions),
+                partial(on_response, version=normalized_versions),
+                is_async_client,
+            )
+            if context_manager is None:
+                # The client was already instrumented; the duplicate policy (warn/error/ignore) has already acted.
+                registration.skip()
+                return nullcontext()
+            return registration.bind_context_manager(context_manager)
 
     def instrument_google_genai(self, **kwargs: Any):
         """Instrument the [Google Gen AI SDK (`google-genai`)](https://googleapis.github.io/python-genai/).
@@ -1517,7 +1646,14 @@ class Logfire:
         from .integrations.google_genai import instrument_google_genai
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_google_genai(self, **kwargs)
+        with self._instrumentation('google_genai', params=kwargs) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.google_genai', 'GoogleGenAiSdkInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.google_genai', 'GoogleGenAiSdkInstrumentor')
+            )
+            instrument_google_genai(self, **kwargs)
 
     def instrument_litellm(self, **kwargs: Any):
         """Instrument the [LiteLLM](https://docs.litellm.ai/) Python SDK.
@@ -1533,7 +1669,14 @@ class Logfire:
         from .integrations.litellm import instrument_litellm
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_litellm(self, **kwargs)
+        with self._instrumentation('litellm', params=kwargs) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('openinference.instrumentation.litellm', 'LiteLLMInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('openinference.instrumentation.litellm', 'LiteLLMInstrumentor')
+            )
+            instrument_litellm(self, **kwargs)
 
     def instrument_dspy(self, **kwargs: Any):
         """Instrument [DSPy](https://dspy.ai/).
@@ -1545,7 +1688,10 @@ class Logfire:
         from .integrations.dspy import instrument_dspy
 
         self._warn_if_not_initialized_for_instrumentation()
-        instrument_dspy(self, **kwargs)
+        with self._instrumentation('dspy', params=kwargs) as registration:
+            registration.set_revert(otel_uninstrument_call('openinference.instrumentation.dspy', 'DSPyInstrumentor'))
+            registration.set_active_probe(otel_active_probe('openinference.instrumentation.dspy', 'DSPyInstrumentor'))
+            instrument_dspy(self, **kwargs)
 
     def instrument_print(self) -> AbstractContextManager[None]:
         """Instrument the built-in `print` function so that calls to it are logged.
@@ -1568,7 +1714,8 @@ class Logfire:
         from .integrations.print import instrument_print
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_print(self)
+        with self._instrumentation('print') as registration:
+            return registration.bind_context_manager(instrument_print(self))
 
     def instrument_asyncpg(self, capture_parameters: bool = False, **kwargs: Any) -> None:
         """Instrument the `asyncpg` module so that spans are automatically created for each query.
@@ -1581,14 +1728,23 @@ class Logfire:
         from .integrations.asyncpg import instrument_asyncpg
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_asyncpg(
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
-                'capture_parameters': capture_parameters,
-                **kwargs,
-            },
-        )
+        with self._instrumentation(
+            'asyncpg', params={'capture_parameters': capture_parameters, **kwargs}
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.asyncpg', 'AsyncPGInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.asyncpg', 'AsyncPGInstrumentor')
+            )
+            return instrument_asyncpg(
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    'capture_parameters': capture_parameters,
+                    **kwargs,
+                },
+            )
 
     @overload
     def instrument_httpx(
@@ -1674,22 +1830,53 @@ class Logfire:
             async_response_hook: A function called right before a span is finished for an async response.
             **kwargs: Additional keyword arguments to pass to the OpenTelemetry `instrument` method, for future compatibility.
         """
-        from .integrations.httpx import instrument_httpx
+        from .integrations.httpx import (
+            HTTPX2ClientInstrumentor,
+            HTTPXClientInstrumentor,
+            instrument_httpx,
+            instrumentor_for_client,
+        )
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_httpx(
-            self,
-            client,
-            capture_all=capture_all,
-            capture_headers=capture_headers,
-            capture_request_body=capture_request_body,
-            capture_response_body=capture_response_body,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            async_request_hook=async_request_hook,
-            async_response_hook=async_response_hook,
+        catalog_params = {
+            'capture_all': capture_all,
+            'capture_headers': capture_headers,
+            'capture_request_body': capture_request_body,
+            'capture_response_body': capture_response_body,
+            'request_hook': request_hook is not None,
+            'response_hook': response_hook is not None,
+            'async_request_hook': async_request_hook is not None,
+            'async_response_hook': async_response_hook is not None,
             **kwargs,
-        )
+        }
+        with self._instrumentation('httpx', target=client, params=catalog_params) as registration:
+            if client is None:
+                instrumentor_classes = [
+                    cls for cls in (HTTPXClientInstrumentor, HTTPX2ClientInstrumentor) if cls is not None
+                ]
+                registration.set_revert(
+                    combine_reverts([lambda cls=cls: cls().uninstrument() for cls in instrumentor_classes])
+                )
+                registration.set_active_probe(
+                    any_active([lambda cls=cls: cls().is_instrumented_by_opentelemetry for cls in instrumentor_classes])
+                )
+            else:
+                instrumentor_class, _is_async = instrumentor_for_client(client)
+                registration.set_revert(lambda: instrumentor_class().uninstrument_client(client))
+                registration.set_active_probe(object_active_probe(client))
+            return instrument_httpx(
+                self,
+                client,
+                capture_all=capture_all,
+                capture_headers=capture_headers,
+                capture_request_body=capture_request_body,
+                capture_response_body=capture_response_body,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                async_request_hook=async_request_hook,
+                async_response_hook=async_response_hook,
+                **kwargs,
+            )
 
     def instrument_celery(self, **kwargs: Any) -> None:
         """Instrument `celery` so that spans are automatically created for each task.
@@ -1710,13 +1897,20 @@ class Logfire:
         from .integrations.celery import instrument_celery
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_celery(
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
-                **kwargs,
-            },
-        )
+        with self._instrumentation('celery', params=kwargs) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.celery', 'CeleryInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.celery', 'CeleryInstrumentor')
+            )
+            return instrument_celery(
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_django(
         self,
@@ -1760,18 +1954,35 @@ class Logfire:
         from .integrations.django import instrument_django
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_django(
-            capture_headers=capture_headers,
-            is_sql_commentor_enabled=is_sql_commentor_enabled,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            excluded_urls=excluded_urls,
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        with self._instrumentation(
+            'django',
+            params={
+                'capture_headers': capture_headers,
+                'is_sql_commentor_enabled': is_sql_commentor_enabled,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
+                'excluded_urls': excluded_urls,
                 **kwargs,
             },
-        )
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.django', 'DjangoInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.django', 'DjangoInstrumentor')
+            )
+            return instrument_django(
+                capture_headers=capture_headers,
+                is_sql_commentor_enabled=is_sql_commentor_enabled,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                excluded_urls=excluded_urls,
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_requests(
         self,
@@ -1791,16 +2002,31 @@ class Logfire:
         from .integrations.requests import instrument_requests
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_requests(
-            excluded_urls=excluded_urls,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        with self._instrumentation(
+            'requests',
+            params={
+                'excluded_urls': excluded_urls,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
                 **kwargs,
             },
-        )
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.requests', 'RequestsInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.requests', 'RequestsInstrumentor')
+            )
+            return instrument_requests(
+                excluded_urls=excluded_urls,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     @overload
     def instrument_psycopg(self, conn_or_module: PsycopgConnection | Psycopg2Connection, **kwargs: Any) -> None: ...
@@ -1841,12 +2067,67 @@ class Logfire:
             **kwargs: Additional keyword arguments to pass to the OpenTelemetry `instrument` methods,
                 for future compatibility.
         """
-        from .integrations.psycopg import instrument_psycopg
+        import types
+
+        from .integrations.psycopg import PACKAGE_NAMES, instrument_psycopg
 
         self._warn_if_not_initialized_for_instrumentation()
         if enable_commenter:
             kwargs.update({'enable_commenter': True, 'commenter_options': commenter_options or {}})
-        return instrument_psycopg(self, conn_or_module=conn_or_module, **kwargs)
+
+        if isinstance(conn_or_module, types.ModuleType):
+            module_name: str | None = conn_or_module.__name__
+            target: Any = None
+        elif isinstance(conn_or_module, str):
+            module_name = conn_or_module
+            target = None
+        elif conn_or_module is None:
+            module_name = None
+            target = None
+        else:
+            module_name = None
+            target = conn_or_module
+
+        with self._instrumentation(
+            'psycopg', target=target, params={'enable_commenter': enable_commenter, **kwargs}
+        ) as registration:
+            if target is None:
+                module_names = (module_name,) if module_name is not None else PACKAGE_NAMES
+                registration.set_revert(
+                    combine_reverts(
+                        [
+                            otel_optional_uninstrument_call(
+                                f'opentelemetry.instrumentation.{name}', f'{name.capitalize()}Instrumentor'
+                            )
+                            for name in module_names
+                        ]
+                    )
+                )
+                registration.set_active_probe(
+                    any_active(
+                        [
+                            otel_active_probe(
+                                f'opentelemetry.instrumentation.{name}', f'{name.capitalize()}Instrumentor'
+                            )
+                            for name in module_names
+                        ]
+                    )
+                )
+            else:
+                connection_package = next(
+                    cls.__module__.split('.')[0]
+                    for cls in type(conn_or_module).__mro__
+                    if cls.__module__.split('.')[0] in PACKAGE_NAMES
+                )
+                registration.set_revert(
+                    otel_uninstrument_call(
+                        f'opentelemetry.instrumentation.{connection_package}',
+                        f'{connection_package.capitalize()}Instrumentor',
+                        'uninstrument_connection',
+                        conn_or_module,
+                    )
+                )
+            return instrument_psycopg(self, conn_or_module=cast(Any, conn_or_module), **kwargs)
 
     def instrument_flask(
         self,
@@ -1880,20 +2161,39 @@ class Logfire:
         from .integrations.flask import instrument_flask
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_flask(
-            app,
-            capture_headers=capture_headers,
-            enable_commenter=enable_commenter,
-            commenter_options=commenter_options,
-            excluded_urls=excluded_urls,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        with self._instrumentation(
+            'flask',
+            target=app,
+            params={
+                'capture_headers': capture_headers,
+                'enable_commenter': enable_commenter,
+                'commenter_options': commenter_options,
+                'excluded_urls': excluded_urls,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
                 **kwargs,
             },
-        )
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call(
+                    'opentelemetry.instrumentation.flask', 'FlaskInstrumentor', 'uninstrument_app', app
+                )
+            )
+            registration.set_active_probe(object_active_probe(app))
+            return instrument_flask(
+                app,
+                capture_headers=capture_headers,
+                enable_commenter=enable_commenter,
+                commenter_options=commenter_options,
+                excluded_urls=excluded_urls,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_litestar(
         self,
@@ -1928,13 +2228,20 @@ class Logfire:
         from .integrations.litestar import instrument_litestar
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_litestar(
-            self,
-            app,
-            capture_headers=capture_headers,
-            record_send_receive=record_send_receive,
-            **kwargs,
-        )
+        # The returned wrapper app isn't patched in place, so there's no symmetric undo.
+        with self._instrumentation(
+            'litestar',
+            target=app,
+            params={'capture_headers': capture_headers, 'record_send_receive': record_send_receive, **kwargs},
+            revertible=False,
+        ):
+            return instrument_litestar(
+                self,
+                app,
+                capture_headers=capture_headers,
+                record_send_receive=record_send_receive,
+                **kwargs,
+            )
 
     def instrument_starlette(
         self,
@@ -1969,16 +2276,34 @@ class Logfire:
         from .integrations.starlette import instrument_starlette
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_starlette(
-            self,
-            app,
-            record_send_receive=record_send_receive,
-            capture_headers=capture_headers,
-            server_request_hook=server_request_hook,
-            client_request_hook=client_request_hook,
-            client_response_hook=client_response_hook,
-            **kwargs,
-        )
+        with self._instrumentation(
+            'starlette',
+            target=app,
+            params={
+                'capture_headers': capture_headers,
+                'record_send_receive': record_send_receive,
+                'server_request_hook': server_request_hook is not None,
+                'client_request_hook': client_request_hook is not None,
+                'client_response_hook': client_response_hook is not None,
+                **kwargs,
+            },
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call(
+                    'opentelemetry.instrumentation.starlette', 'StarletteInstrumentor', 'uninstrument_app', app
+                )
+            )
+            registration.set_active_probe(object_active_probe(app))
+            return instrument_starlette(
+                self,
+                app,
+                record_send_receive=record_send_receive,
+                capture_headers=capture_headers,
+                server_request_hook=server_request_hook,
+                client_request_hook=client_request_hook,
+                client_response_hook=client_response_hook,
+                **kwargs,
+            )
 
     def instrument_asgi(
         self,
@@ -2011,13 +2336,20 @@ class Logfire:
         from .integrations.asgi import instrument_asgi
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_asgi(
-            self,
-            app,
-            record_send_receive=record_send_receive,
-            capture_headers=capture_headers,
-            **kwargs,
-        )
+        # The returned wrapper app isn't patched in place, so there's no symmetric undo.
+        with self._instrumentation(
+            'asgi',
+            target=app,
+            params={'capture_headers': capture_headers, 'record_send_receive': record_send_receive, **kwargs},
+            revertible=False,
+        ):
+            return instrument_asgi(
+                self,
+                app,
+                record_send_receive=record_send_receive,
+                capture_headers=capture_headers,
+                **kwargs,
+            )
 
     def instrument_wsgi(
         self,
@@ -2048,17 +2380,29 @@ class Logfire:
         from .integrations.wsgi import instrument_wsgi
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_wsgi(
-            app,
-            capture_headers=capture_headers,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        # The returned wrapper app isn't patched in place, so there's no symmetric undo.
+        with self._instrumentation(
+            'wsgi',
+            target=app,
+            params={
+                'capture_headers': capture_headers,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
                 **kwargs,
             },
-        )
+            revertible=False,
+        ):
+            return instrument_wsgi(
+                app,
+                capture_headers=capture_headers,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_aiohttp_client(
         self,
@@ -2080,16 +2424,34 @@ class Logfire:
         from .integrations.aiohttp_client import instrument_aiohttp_client
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_aiohttp_client(
-            self,
-            capture_all=capture_all,
-            capture_request_body=capture_request_body,
-            capture_response_body=capture_response_body,
-            capture_headers=capture_headers,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            **kwargs,
-        )
+        with self._instrumentation(
+            'aiohttp_client',
+            params={
+                'capture_all': capture_all,
+                'capture_request_body': capture_request_body,
+                'capture_response_body': capture_response_body,
+                'capture_headers': capture_headers,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
+                **kwargs,
+            },
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.aiohttp_client', 'AioHttpClientInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.aiohttp_client', 'AioHttpClientInstrumentor')
+            )
+            return instrument_aiohttp_client(
+                self,
+                capture_all=capture_all,
+                capture_request_body=capture_request_body,
+                capture_response_body=capture_response_body,
+                capture_headers=capture_headers,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                **kwargs,
+            )
 
     def instrument_aiohttp_server(self, **kwargs: Any) -> None:
         """Instrument the `aiohttp` module so that spans are automatically created for each server request.
@@ -2101,13 +2463,20 @@ class Logfire:
         from .integrations.aiohttp_server import instrument_aiohttp_server
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_aiohttp_server(
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
-                **kwargs,
-            },
-        )
+        with self._instrumentation('aiohttp_server', params=kwargs) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.aiohttp_server', 'AioHttpServerInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.aiohttp_server', 'AioHttpServerInstrumentor')
+            )
+            return instrument_aiohttp_server(
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_sqlalchemy(
         self,
@@ -2133,17 +2502,36 @@ class Logfire:
         from .integrations.sqlalchemy import instrument_sqlalchemy
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_sqlalchemy(
-            engine=engine,
-            engines=engines,
-            enable_commenter=enable_commenter,
-            commenter_options=commenter_options or {},
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        target: Any = engine
+        if target is None and engines is not None:
+            target = tuple(engines)
+        with self._instrumentation(
+            'sqlalchemy',
+            target=target,
+            params={
+                'enable_commenter': enable_commenter,
+                'commenter_options': commenter_options,
                 **kwargs,
             },
-        )
+        ) as registration:
+            # Teardown goes through the global instrumentor, which removes all the listeners it added.
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.sqlalchemy', 'SQLAlchemyInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.sqlalchemy', 'SQLAlchemyInstrumentor')
+            )
+            return instrument_sqlalchemy(
+                engine=engine,
+                engines=engines,
+                enable_commenter=enable_commenter,
+                commenter_options=commenter_options or {},
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_sqlite3(self, conn: SQLite3Connection = None, **kwargs: Any) -> SQLite3Connection:
         """Instrument the `sqlite3` module or a specific connection so that spans are automatically created for each operation.
@@ -2162,7 +2550,24 @@ class Logfire:
         from .integrations.sqlite3 import instrument_sqlite3
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_sqlite3(conn=conn, **{'tracer_provider': self._config.get_tracer_provider(), **kwargs})
+        with self._instrumentation('sqlite3', target=conn, params=kwargs) as registration:
+            if conn is None:
+                registration.set_revert(
+                    otel_uninstrument_call('opentelemetry.instrumentation.sqlite3', 'SQLite3Instrumentor')
+                )
+                registration.set_active_probe(
+                    otel_active_probe('opentelemetry.instrumentation.sqlite3', 'SQLite3Instrumentor')
+                )
+            else:
+                registration.set_revert(
+                    otel_uninstrument_call(
+                        'opentelemetry.instrumentation.sqlite3',
+                        'SQLite3Instrumentor',
+                        'uninstrument_connection',
+                        conn,
+                    )
+                )
+            return instrument_sqlite3(conn=conn, **{'tracer_provider': self._config.get_tracer_provider(), **kwargs})
 
     def instrument_aws_lambda(
         self,
@@ -2184,15 +2589,21 @@ class Logfire:
         from .integrations.aws_lambda import instrument_aws_lambda
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_aws_lambda(
-            lambda_handler=lambda_handler,
-            event_context_extractor=event_context_extractor,
-            **{  # pyright: ignore[reportArgumentType]
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
-                **kwargs,
-            },
-        )
+        with self._instrumentation(
+            'aws_lambda',
+            target=lambda_handler,
+            params={'event_context_extractor': event_context_extractor is not None, **kwargs},
+            revertible=False,
+        ):
+            return instrument_aws_lambda(
+                lambda_handler=lambda_handler,
+                event_context_extractor=event_context_extractor,
+                **{  # pyright: ignore[reportArgumentType]
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_pymongo(
         self,
@@ -2218,17 +2629,33 @@ class Logfire:
         from .integrations.pymongo import instrument_pymongo
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_pymongo(
-            capture_statement=capture_statement,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            failed_hook=failed_hook,
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        with self._instrumentation(
+            'pymongo',
+            params={
+                'capture_statement': capture_statement,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
+                'failed_hook': failed_hook is not None,
                 **kwargs,
             },
-        )
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.pymongo', 'PymongoInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.pymongo', 'PymongoInstrumentor')
+            )
+            return instrument_pymongo(
+                capture_statement=capture_statement,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                failed_hook=failed_hook,
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_redis(
         self,
@@ -2252,16 +2679,27 @@ class Logfire:
         from .integrations.redis import instrument_redis
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_redis(
-            capture_statement=capture_statement,
-            request_hook=request_hook,
-            response_hook=response_hook,
-            **{
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
+        with self._instrumentation(
+            'redis',
+            params={
+                'capture_statement': capture_statement,
+                'request_hook': request_hook is not None,
+                'response_hook': response_hook is not None,
                 **kwargs,
             },
-        )
+        ) as registration:
+            registration.set_revert(otel_uninstrument_call('opentelemetry.instrumentation.redis', 'RedisInstrumentor'))
+            registration.set_active_probe(otel_active_probe('opentelemetry.instrumentation.redis', 'RedisInstrumentor'))
+            return instrument_redis(
+                capture_statement=capture_statement,
+                request_hook=request_hook,
+                response_hook=response_hook,
+                **{
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_mysql(self, conn: MySQLConnection = None, **kwargs: Any) -> MySQLConnection:
         """Instrument the `mysql` module or a specific MySQL connection so that spans are automatically created for each operation.
@@ -2280,14 +2718,31 @@ class Logfire:
         from .integrations.mysql import instrument_mysql
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_mysql(
-            conn=conn,
-            **{  # pyright: ignore[reportArgumentType]
-                'tracer_provider': self._config.get_tracer_provider(),
-                'meter_provider': self._config.get_meter_provider(),
-                **kwargs,
-            },
-        )
+        with self._instrumentation('mysql', target=conn, params=kwargs) as registration:
+            if conn is None:
+                registration.set_revert(
+                    otel_uninstrument_call('opentelemetry.instrumentation.mysql', 'MySQLInstrumentor')
+                )
+                registration.set_active_probe(
+                    otel_active_probe('opentelemetry.instrumentation.mysql', 'MySQLInstrumentor')
+                )
+            else:
+                registration.set_revert(
+                    otel_uninstrument_call(
+                        'opentelemetry.instrumentation.mysql',
+                        'MySQLInstrumentor',
+                        'uninstrument_connection',
+                        conn,
+                    )
+                )
+            return instrument_mysql(
+                conn=conn,
+                **{  # pyright: ignore[reportArgumentType]
+                    'tracer_provider': self._config.get_tracer_provider(),
+                    'meter_provider': self._config.get_meter_provider(),
+                    **kwargs,
+                },
+            )
 
     def instrument_system_metrics(
         self, config: SystemMetricsConfig | None = None, base: SystemMetricsBase = 'basic'
@@ -2305,7 +2760,17 @@ class Logfire:
         from .integrations.system_metrics import instrument_system_metrics
 
         self._warn_if_not_initialized_for_instrumentation()
-        return instrument_system_metrics(self, config, base)
+        with self._instrumentation(
+            'system_metrics',
+            params={'base': base, 'config': sorted(config) if config else None},
+        ) as registration:
+            registration.set_revert(
+                otel_uninstrument_call('opentelemetry.instrumentation.system_metrics', 'SystemMetricsInstrumentor')
+            )
+            registration.set_active_probe(
+                otel_active_probe('opentelemetry.instrumentation.system_metrics', 'SystemMetricsInstrumentor')
+            )
+            return instrument_system_metrics(self, config, base)
 
     def metric_counter(self, name: str, *, unit: str = '', description: str = '') -> Counter:
         """Create a counter metric.

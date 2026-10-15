@@ -603,9 +603,18 @@ def test_inject_hooks_with_existing_events() -> None:
 
 @pytest.mark.anyio
 async def test_already_instrumented() -> None:
-    """Calling instrument twice is a no-op (idempotent)."""
-    logfire.instrument_claude_agent_sdk()
-    logfire.instrument_claude_agent_sdk()
+    """The SDK stays single-patched, and a repeat call is reported via the catalog."""
+    # The autouse fixture already installed one layer; this is the first in-test repeat.
+    with logfire.instrumentations.on_duplicate('ignore'):
+        first = logfire.instrument_claude_agent_sdk()
+    try:
+        # A further repeat surfaces the existing catalog entry.
+        with pytest.warns(UserWarning, match='already instrumented'):
+            second = logfire.instrument_claude_agent_sdk()
+        second.__exit__(None, None, None)
+    finally:
+        # Don't leave the bare (un-entered) context managers active for later tests.
+        first.__exit__(None, None, None)
     # No error, and only one layer of patching
 
 

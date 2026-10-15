@@ -23,6 +23,13 @@ from ._internal.config import (
     configure,
 )
 from ._internal.constants import LevelName
+from ._internal.instrumentation_registry import (
+    DuplicateInstrumentationError,
+    InstrumentationInfo,
+    InstrumentationNotRevertibleError,
+    InstrumentationOrigin,
+    instrumentations,
+)
 from ._internal.main import Logfire, LogfireSpan
 from ._internal.scrubbing import ScrubbingOptions, ScrubMatch
 from ._internal.stack_info import add_non_user_code_prefix
@@ -186,6 +193,11 @@ __all__ = (
     'instrument_system_metrics',
     'instrument_mcp',
     'instrument_claude_agent_sdk',
+    'instrumentations',
+    'InstrumentationInfo',
+    'InstrumentationOrigin',
+    'DuplicateInstrumentationError',
+    'InstrumentationNotRevertibleError',
     'AutoTraceModule',
     'with_tags',
     'with_settings',

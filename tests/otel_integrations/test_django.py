@@ -14,6 +14,13 @@ import logfire._internal.integrations.django
 from logfire.testing import CaptureLogfire, TestExporter
 
 
+@pytest.fixture(autouse=True)
+def _allow_repeated_django_instrumentation():
+    # Django instrumentation is process-global and installed once per test in this file.
+    with logfire.instrumentations.on_duplicate('ignore'):
+        yield
+
+
 def test_django_test_project_modules() -> None:
     """Test that Django test project modules are importable for coverage."""
     from tests.otel_integrations.django_test_project.django_test_app import apps as django_test_app_apps

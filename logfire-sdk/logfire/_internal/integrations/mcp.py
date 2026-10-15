@@ -27,7 +27,11 @@ class _RequestResponder(Protocol):
     respond: Callable[..., Awaitable[None]]
 
 
-def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
+def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool) -> bool:
+    """Instrument MCP 1 sessions.
+
+    Returns `True` when patches were applied, or `False` for mcp 2 which instruments itself.
+    """
     try:
         BaseSession = import_module('mcp.shared.session').BaseSession
     except ModuleNotFoundError as exc:
@@ -44,7 +48,7 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
         if not propagate_otel_context:
             message += ' `propagate_otel_context=False` is ignored because the SDK always propagates context.'
         warnings.warn(message, UserWarning, stacklevel=3)
-        return
+        return False
 
     # These private APIs exist only in MCP 1; import them dynamically so typing
     # does not depend on which MCP major version is installed.
@@ -81,6 +85,7 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
             span.set_attribute('response', result)
             return result
 
+    send_request._logfire_patched = True  # type: ignore[attr-defined]
     BaseSession.send_request = send_request
 
     original_send_notification = BaseSession.send_notification
@@ -90,6 +95,7 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
         _attach_context_to_request(getattr(notification, 'root', notification))
         return await original_send_notification(self, notification, *args, **kwargs)
 
+    send_notification._logfire_patched = True  # type: ignore[attr-defined]
     BaseSession.send_notification = send_notification
 
     original_received_notification = ClientSession._received_notification
@@ -114,6 +120,7 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
                     logfire_instance.log(level, span_name, attributes=dict(data=params.data))
         await original_received_notification(self, notification, *args, **kwargs)
 
+    _received_notification._logfire_patched = True  # type: ignore[attr-defined]
     ClientSession._received_notification = _received_notification
 
     original_handle_client_request = ClientSession._received_request
@@ -125,6 +132,7 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
         with _handle_request_with_context(request, responder, span_name):
             await original_handle_client_request(self, responder)
 
+    _received_request_client._logfire_patched = True  # type: ignore[attr-defined]
     ClientSession._received_request = _received_request_client
 
     original_handle_server_request = Server._handle_request
@@ -135,6 +143,7 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
         with _handle_request_with_context(request, message, span_name):
             return await original_handle_server_request(self, message, request, *args, **kwargs)
 
+    _handle_request._logfire_patched = True  # type: ignore[attr-defined]
     Server._handle_request = _handle_request
 
     @contextmanager
@@ -183,6 +192,22 @@ def instrument_mcp(logfire_instance: Logfire, propagate_otel_context: bool):
             params.meta = type(params).Meta.model_validate({**carrier, **dumped_meta})  # pyright: ignore[reportUnknownMemberType]
         else:
             root.params = _request_params_type_adapter(type(root)).validate_python({'_meta': carrier})  # pyright: ignore[reportUnknownArgumentType]
+
+    return True
+
+
+def is_mcp_instrumented() -> bool:
+    """Whether the MCP 1 session classes currently carry Logfire patches.
+
+    Returns `False` with mcp 2, which has no patches to detect.
+    """
+    try:
+        BaseSession = import_module('mcp.shared.session').BaseSession
+    except ModuleNotFoundError as exc:
+        if exc.name != 'mcp.shared.session':  # pragma: no cover
+            raise
+        return False
+    return bool(getattr(BaseSession.send_request, '_logfire_patched', False))
 
 
 @functools.lru_cache

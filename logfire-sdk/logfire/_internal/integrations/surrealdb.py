@@ -45,6 +45,27 @@ def get_all_surrealdb_classes() -> set[type]:
     return _get_all_subclasses(SyncTemplate) | _get_all_subclasses(AsyncTemplate)
 
 
+def _template_method_names() -> list[str]:
+    return [
+        name
+        for name, template_method in inspect.getmembers(SyncTemplate)
+        if inspect.isfunction(template_method)
+        and not name.startswith('_')
+        and SyncTemplate.__dict__.get(name) == template_method
+    ]
+
+
+def is_surrealdb_instrumented(
+    obj: SyncTemplate | AsyncTemplate | type[SyncTemplate] | type[AsyncTemplate] | None = None,
+) -> bool:
+    """Whether all-connection instrumentation is active (``obj=None``) or this object's methods are patched."""
+    objs = get_all_surrealdb_classes() if obj is None else [obj]
+    return any(
+        any(getattr(getattr(target, name, None), '_logfire_template', False) for name in _template_method_names())
+        for target in objs
+    )
+
+
 def instrument_surrealdb(
     obj: SyncTemplate | AsyncTemplate | type[SyncTemplate] | type[AsyncTemplate] | None, logfire_instance: Logfire
 ):
@@ -54,13 +75,8 @@ def instrument_surrealdb(
             instrument_surrealdb(cls, logfire_instance)
         return
 
-    for name, template_method in inspect.getmembers(SyncTemplate):
-        if not (
-            inspect.isfunction(template_method)
-            and not name.startswith('_')
-            and SyncTemplate.__dict__.get(name) == template_method
-        ):
-            continue
+    for name in _template_method_names():
+        template_method = getattr(SyncTemplate, name)
         patch_method(obj, name, template_method, logfire_instance)
 
 

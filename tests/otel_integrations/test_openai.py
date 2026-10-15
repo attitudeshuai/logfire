@@ -373,9 +373,12 @@ def instrumented_client() -> Iterator[openai.Client]:
 
         # Test instrumenting a class
         with logfire.instrument_openai(openai.Client, version=[1, 'latest']):
-            # Test repeatedly instrumenting something already instrumented (should do nothing)
-            with logfire.instrument_openai(openai.Client, version=[1, 'latest']):
-                pass
+            # Repeated instrumentation now points at the existing catalog entry via a warning;
+            # the underlying client is still only patched once.
+            with pytest.warns(UserWarning, match='already instrumented'):
+                with logfire.instrument_openai(openai.Client, version=[1, 'latest']):
+                    pass
+            # An instance of an already-instrumented class stays a silent no-op.
             with logfire.instrument_openai(openai_client, version=[1, 'latest']):
                 pass
 

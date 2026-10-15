@@ -22,6 +22,13 @@ from logfire._internal.integrations.monty import LogfireMontyLogger, LogfireMont
 from logfire.testing import TestExporter, TestLogExporter, TimeGenerator, get_collected_metrics
 
 
+@pytest.fixture(autouse=True)
+def allow_repeated_monty_installation() -> Any:
+    # `instrument_monty()` is process-global and one-shot, so these tests call it repeatedly.
+    with logfire.instrumentations.on_duplicate('ignore'):
+        yield
+
+
 @pytest.mark.parametrize('package_installed', [False, True])
 def test_instrument_monty_dependency_errors(monkeypatch: pytest.MonkeyPatch, package_installed: bool) -> None:
     if package_installed:
@@ -187,7 +194,10 @@ def test_instrument_monty_sampling(exporter: TestExporter, config_kwargs: dict[s
 
 def test_instrument_monty_is_idempotent(exporter: TestExporter) -> None:
     logfire.instrument_monty()
-    logfire.instrument_monty()
+    # The instrumentation itself stays one-shot, but the catalog now reports the repeat call.
+    with logfire.instrumentations.on_duplicate('warn'):
+        with pytest.warns(UserWarning, match='already instrumented'):
+            logfire.instrument_monty()
 
     with Monty() as pool:
         with pool.checkout() as session:

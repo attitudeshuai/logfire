@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import functools
 from types import ModuleType
-from typing import Any
+from typing import Any, cast
 from weakref import WeakKeyDictionary
 
 from logfire import Logfire
@@ -47,6 +47,13 @@ def instrument_snowflake(
     else:
         raise ValueError(f"Don't know how to instrument {conn_or_module!r}")
     _patch_cursor_class()
+
+
+def is_snowflake_instrumented(conn_or_module: ModuleType | SnowflakeConnection | None = None) -> bool:
+    """Whether the module is instrumented (``None``/module) or this connection has its own settings."""
+    if conn_or_module is None or conn_or_module is sf_connector:
+        return _module_settings is not None
+    return _connection_settings.get(cast(SnowflakeConnection, conn_or_module)) is not None
 
 
 def _warn_capture_parameters_ignored(existing: bool) -> None:
