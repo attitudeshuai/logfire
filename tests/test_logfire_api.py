@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import importlib
 import sys
 import warnings
@@ -389,6 +390,19 @@ def test_runtime(logfire_api_factory: Callable[[], ModuleType], module_name: str
     assert hasattr(logfire_api, 'MetricsOptions')
     logfire_api.MetricsOptions()
     logfire__all__.remove('MetricsOptions')
+
+    assert hasattr(logfire_api, 'OpenSpansOptions')
+    logfire_api.OpenSpansOptions(max_age=datetime.timedelta(seconds=1))
+    logfire__all__.remove('OpenSpansOptions')
+
+    assert hasattr(logfire_api, 'OpenSpanInfo')
+    logfire__all__.remove('OpenSpanInfo')
+
+    assert hasattr(logfire_api, 'OpenSpansSnapshot')
+    logfire__all__.remove('OpenSpansSnapshot')
+
+    assert hasattr(logfire_api, 'get_open_spans')
+    logfire__all__.remove('get_open_spans')
 
     assert hasattr(logfire_api, 'logfire_info')
     logfire_api.logfire_info()

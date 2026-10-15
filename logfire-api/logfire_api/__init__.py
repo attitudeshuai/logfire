@@ -343,3 +343,14 @@ except ImportError:
 
         def attach_context(*args, **kwargs) -> AbstractContextManager[None]:
             return nullcontext()
+
+        class OpenSpansOptions:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class OpenSpanInfo:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class OpenSpansSnapshot:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        def get_open_spans(*args, **kwargs) -> None: ...

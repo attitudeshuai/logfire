@@ -121,10 +121,11 @@ from .integrations.executors import instrument_executors
 from .interactive import ask_or_default, ask_required, require_answer
 from .logs import ProxyLoggerProvider
 from .metrics import ProxyMeterProvider
+from .open_spans import OpenSpansMonitor, OpenSpansOptions, set_active_monitor
 from .scrubbing import NOOP_SCRUBBER, BaseScrubber, Scrubber, ScrubbingOptions
 from .server_response import ServerResponseCallback, install_logfire_response_hook
 from .stack_info import warn_at_user_stacklevel
-from .tracer import OPEN_SPANS, PendingSpanProcessor, ProxyTracerProvider
+from .tracer import PendingSpanProcessor, ProxyTracerProvider
 from .utils import (
     SeededRandomIdGenerator,
     ensure_data_dir_exists,
@@ -540,6 +541,7 @@ def configure(
     code_source: CodeSource | None = None,
     variables: VariablesOptions | LocalVariablesOptions | None = None,
     distributed_tracing: bool | None = None,
+    open_spans: OpenSpansOptions | None = None,
     advanced: AdvancedOptions | None = None,
 ) -> Logfire:
     """Configure the logfire SDK.
@@ -623,6 +625,10 @@ def configure(
             See [Unintentional Distributed Tracing](https://logfire.pydantic.dev/docs/how-to-guides/distributed-tracing/#unintentional-distributed-tracing)
             for more information.
             This setting always applies globally, and the last value set is used, including the default value.
+        open_spans: Options for detecting spans that stay open for longer than a maximum age. When set,
+            spans that exceed the age are registered in a queryable list (`logfire.get_open_spans()`),
+            entries disappear when spans end normally, and a summary of spans force-ended at process
+            exit is logged. When `None` (the default), open-span behavior is unchanged.
         advanced: Advanced options primarily used for testing by Logfire developers.
     """
     from .. import DEFAULT_LOGFIRE_INSTANCE, Logfire
@@ -653,6 +659,7 @@ def configure(
             code_source=code_source,
             variables=variables,
             distributed_tracing=distributed_tracing,
+            open_spans=open_spans,
             advanced=advanced,
         )
     except LogfireConfigError as e:
@@ -741,6 +748,9 @@ class _LogfireConfigData:
     distributed_tracing: bool | None
     """Whether to extract incoming trace context."""
 
+    open_spans: OpenSpansOptions | None
+    """Options for detecting spans that stay open for too long, or `None` to disable."""
+
     advanced: AdvancedOptions
     """Advanced options primarily used for testing by Logfire developers."""
 
@@ -769,6 +779,7 @@ class _LogfireConfigData:
         code_source: CodeSource | None,
         variables: VariablesOptions | LocalVariablesOptions | None,
         distributed_tracing: bool | None,
+        open_spans: OpenSpansOptions | None,
         advanced: AdvancedOptions | None,
     ) -> None:
         """Merge the given parameters with the environment variables file configurations."""
@@ -879,6 +890,18 @@ class _LogfireConfigData:
         advanced.resource_detectors = resource_detectors
         self.advanced = advanced
 
+        if isinstance(open_spans, dict):
+            # This is particularly for deserializing from a dict as in executors.py
+            open_spans = OpenSpansOptions(**open_spans)  # pyright: ignore[reportUnknownArgumentType]
+        if open_spans is not None:
+            if open_spans.max_age <= timedelta(0):
+                raise LogfireConfigError(
+                    f'open_spans.max_age must be a positive timedelta, got {open_spans.max_age!r}.'
+                )
+            if open_spans.max_entries < 1:
+                raise LogfireConfigError(f'open_spans.max_entries must be at least 1, got {open_spans.max_entries}.')
+        self.open_spans = open_spans
+
         self.additional_span_processors = additional_span_processors
         self._project_url: str | None = None
 
@@ -960,6 +983,7 @@ class LogfireConfig(_LogfireConfigData):
         variables: VariablesOptions | None = None,
         code_source: CodeSource | None = None,
         distributed_tracing: bool | None = None,
+        open_spans: OpenSpansOptions | None = None,
         advanced: AdvancedOptions | None = None,
     ) -> None:
         """Create a new LogfireConfig.
@@ -991,6 +1015,7 @@ class LogfireConfig(_LogfireConfigData):
             code_source=code_source,
             variables=variables,
             distributed_tracing=distributed_tracing,
+            open_spans=open_spans,
             advanced=advanced,
         )
         # initialize with no-ops so that we don't impact OTEL's global config just because logfire is installed
@@ -1003,6 +1028,8 @@ class LogfireConfig(_LogfireConfigData):
         self._logger_provider = ProxyLoggerProvider(NoOpLoggerProvider())
         _register_at_fork_resource_updates(self._tracer_provider, self._meter_provider, self._logger_provider)
         self._otlp_forwarding = OTLPForwardingManager([])
+        # Created in `_initialize()` when the `open_spans` option is configured.
+        self._open_spans_monitor: OpenSpansMonitor | None = None
         self._variables: dict[str, Variable[Any] | TemplateVariable[Any, Any]] = {}
         # This ensures that we only call OTEL's global set_tracer_provider once to avoid warnings.
         self._has_set_providers = False
@@ -1031,6 +1058,7 @@ class LogfireConfig(_LogfireConfigData):
         code_source: CodeSource | None,
         variables: VariablesOptions | LocalVariablesOptions | None,
         distributed_tracing: bool | None,
+        open_spans: OpenSpansOptions | None,
         advanced: AdvancedOptions | None,
     ) -> None:
         with self._lock:
@@ -1056,6 +1084,7 @@ class LogfireConfig(_LogfireConfigData):
                 code_source,
                 variables,
                 distributed_tracing,
+                open_spans,
                 advanced,
             )
             self.initialize()
@@ -1508,6 +1537,18 @@ class LogfireConfig(_LogfireConfigData):
             # Track this instance for cleanup on exit
             _LOGFIRE_CONFIG_INSTANCES.append(weakref.ref(self))
 
+            # Set up long-running open span detection. Spans pick up this monitor when they start,
+            # so only spans created after (re)configuration are tracked.
+            if self.open_spans is None:
+                self._open_spans_monitor = None
+            else:
+                self._open_spans_monitor = OpenSpansMonitor(
+                    self.open_spans,
+                    now=self.advanced.ns_timestamp_generator,
+                )
+            if self is GLOBAL_CONFIG:
+                set_active_monitor(self._open_spans_monitor)
+
             # OTEL registers its own atexit callback in the tracer/meter providers to shut them down.
             # Registering this callback here after the OTEL one means that this runs first.
             # Otherwise OTEL would log an error "Already shutdown, dropping span."
@@ -1811,12 +1852,11 @@ def exit_open_spans():  # pragma: no cover
     # The reason that spans may be lingering open is that they're in suspended generator frames.
     # Apart from here, they will be ended when the generator is garbage collected
     # as the interpreter shuts down, but that's too late.
-    for span in list(OPEN_SPANS.values()):
-        # TODO maybe we should be recording something about what happened here?
-        span.end()
-        # Interpreter shutdown may trigger another call to .end(),
-        # which would log a warning "Calling end() on an ended span."
-        span.end = lambda *_, **__: None  # pyright: ignore[reportUnknownLambdaType]
+    # When long-running span detection is enabled, a summary of the force-ended spans and how long
+    # each had been open is logged by `end_open_spans_at_exit`.
+    from .open_spans import end_open_spans_at_exit
+
+    end_open_spans_at_exit()
 
 
 def shutdown_otlp_forwarding(timeout_millis: int = 30_000) -> None:

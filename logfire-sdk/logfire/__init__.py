@@ -24,6 +24,7 @@ from ._internal.config import (
 )
 from ._internal.constants import LevelName
 from ._internal.main import Logfire, LogfireSpan
+from ._internal.open_spans import OpenSpanInfo, OpenSpansOptions, OpenSpansSnapshot, get_open_spans
 from ._internal.scrubbing import ScrubbingOptions, ScrubMatch
 from ._internal.stack_info import add_non_user_code_prefix
 from ._internal.utils import suppress_instrumentation
@@ -205,6 +206,10 @@ __all__ = (
     'MetricsOptions',
     'VariablesOptions',
     'LocalVariablesOptions',
+    'OpenSpansOptions',
+    'OpenSpanInfo',
+    'OpenSpansSnapshot',
+    'get_open_spans',
     'variables',
     'var',
     'template_var',

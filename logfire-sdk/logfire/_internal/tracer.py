@@ -42,6 +42,7 @@ from .utils import handle_internal_errors, sha256_string
 if TYPE_CHECKING:
     from ..types import ExceptionCallback
     from .config import LogfireConfig
+    from .open_spans import OpenSpansMonitor
 
 try:
     from pydantic import ValidationError
@@ -152,13 +153,31 @@ class _LogfireWrappedSpan(trace_api.Span, ReadableSpan):
     record_metrics: bool
     metrics: dict[str, SpanMetric] = field(default_factory=lambda: defaultdict(SpanMetric))
     exception_callback: ExceptionCallback | None = None
+    open_spans_monitor: OpenSpansMonitor | None = None
+    start_time_ns: int = 0
+    start_name: str = ''
+    start_attributes: Mapping[str, otel_types.AttributeValue] = field(
+        default_factory=dict[str, otel_types.AttributeValue]
+    )
 
     def __post_init__(self):
         OPEN_SPANS[self._open_spans_key()] = self
+        if self.open_spans_monitor is not None:
+            # Long-running span detection is best-effort and must never affect the span lifecycle.
+            with handle_internal_errors:
+                self.open_spans_monitor.note_started(
+                    self,
+                    name=self.start_name,
+                    start_time_ns=self.start_time_ns,
+                    attributes=self.start_attributes,
+                )
 
     def end(self, end_time: int | None = None) -> None:
         with handle_internal_errors:
-            OPEN_SPANS.pop(self._open_spans_key(), None)
+            key = self._open_spans_key()
+            OPEN_SPANS.pop(key, None)
+            if self.open_spans_monitor is not None:
+                self.open_spans_monitor.note_ended(key)
             if self.metrics:
                 self.span.set_attribute(
                     'logfire.metrics', json.dumps({name: metric.dump() for name, metric in self.metrics.items()})
@@ -325,11 +344,22 @@ class _ProxyTracer(Tracer):
                     ),
                 )
             )
+        # Only real spans participate in long-running span detection, not the internal spans
+        # created for logs, which are ended almost immediately.
+        open_spans_monitor = (
+            config._open_spans_monitor  # pyright: ignore[reportPrivateUsage]
+            if self.is_span_tracer
+            else None
+        )
         return _LogfireWrappedSpan(
             span,
             ns_timestamp_generator=ns_timestamp_generator,
             record_metrics=record_metrics,
             exception_callback=exception_callback,
+            open_spans_monitor=open_spans_monitor,
+            start_time_ns=start_time,
+            start_name=name,
+            start_attributes=attributes,
         )
 
     # This means that `with start_as_current_span(...):`
