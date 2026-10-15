@@ -137,6 +137,7 @@ if TYPE_CHECKING:
     from .integrations.psycopg import Psycopg2Connection, PsycopgConnection
     from .integrations.sqlite3 import SQLite3Connection
     from .integrations.system_metrics import Base as SystemMetricsBase, Config as SystemMetricsConfig
+    from .scrubbing import ScrubbingSummary
     from .utils import SysExcInfo
 
     # This is the type of the exc_info/_exc_info parameter of the log methods.
@@ -921,6 +922,14 @@ class Logfire:
             Whether every component that reports a status flushed successfully.
         """
         return self._config.force_flush(timeout_millis)
+
+    def get_scrubbing_summary(self) -> ScrubbingSummary | None:
+        """Get an immutable snapshot of scrubbing hits recorded since configuration.
+
+        Returns `None` unless `ScrubbingOptions.summary` is configured.
+        See [`logfire.ScrubbingSummaryOptions`][logfire.ScrubbingSummaryOptions].
+        """
+        return self._config.scrubber.get_scrubbing_summary()
 
     def url_from_eval(self, report: EvaluationReport[Any, Any, Any]) -> str | None:
         """Generate a Logfire URL to view an evaluation report.

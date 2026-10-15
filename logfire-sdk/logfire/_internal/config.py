@@ -19,7 +19,7 @@ from datetime import timedelta
 from importlib.metadata import entry_points
 from pathlib import Path
 from threading import RLock, Thread
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, cast
 from urllib.parse import urljoin
 from uuid import uuid4
 
@@ -121,7 +121,13 @@ from .integrations.executors import instrument_executors
 from .interactive import ask_or_default, ask_required, require_answer
 from .logs import ProxyLoggerProvider
 from .metrics import ProxyMeterProvider
-from .scrubbing import NOOP_SCRUBBER, BaseScrubber, Scrubber, ScrubbingOptions
+from .scrubbing import (
+    NOOP_SCRUBBER,
+    BaseScrubber,
+    Scrubber,
+    ScrubbingOptions,
+    ScrubbingSummaryOptions,
+)
 from .server_response import ServerResponseCallback, install_logfire_response_hook
 from .stack_info import warn_at_user_stacklevel
 from .tracer import OPEN_SPANS, PendingSpanProcessor, ProxyTracerProvider
@@ -797,12 +803,23 @@ class _LogfireConfigData:
         # We save `scrubbing` just so that it can be serialized and deserialized.
         if isinstance(scrubbing, dict):
             # This is particularly for deserializing from a dict as in executors.py
-            scrubbing = ScrubbingOptions(**scrubbing)  # pyright: ignore[reportUnknownArgumentType]
+            scrubbing_dict = cast('dict[str, Any]', scrubbing)
+            summary_options = scrubbing_dict.get('summary')
+            if isinstance(summary_options, dict):
+                scrubbing_dict['summary'] = ScrubbingSummaryOptions(**cast('dict[str, Any]', summary_options))
+            scrubbing = ScrubbingOptions(**scrubbing_dict)
         if scrubbing is None:
             scrubbing = ScrubbingOptions()
         self.scrubbing: ScrubbingOptions | Literal[False] = scrubbing
         self.scrubber: BaseScrubber = (
-            Scrubber(scrubbing.extra_patterns, scrubbing.callback) if scrubbing else NOOP_SCRUBBER
+            Scrubber(
+                scrubbing.extra_patterns,
+                scrubbing.callback,
+                dry_run=scrubbing.dry_run,
+                summary_options=scrubbing.summary,
+            )
+            if scrubbing
+            else NOOP_SCRUBBER
         )
 
         if isinstance(console, dict):

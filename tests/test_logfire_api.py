@@ -382,6 +382,18 @@ def test_runtime(logfire_api_factory: Callable[[], ModuleType], module_name: str
     logfire_api.ScrubbingOptions()
     logfire__all__.remove('ScrubbingOptions')
 
+    assert hasattr(logfire_api, 'ScrubbingSummaryOptions')
+    logfire_api.ScrubbingSummaryOptions()
+    logfire__all__.remove('ScrubbingSummaryOptions')
+
+    for summary_class in ['ScrubbingSummary', 'ScrubbingPatternSummary', 'ScrubbingPathSummary']:
+        assert hasattr(logfire_api, summary_class)
+        logfire__all__.remove(summary_class)
+
+    assert hasattr(logfire_api, 'get_scrubbing_summary')
+    assert logfire_api.get_scrubbing_summary() is None
+    logfire__all__.remove('get_scrubbing_summary')
+
     assert hasattr(logfire_api, 'AdvancedOptions')
     logfire_api.AdvancedOptions()
     logfire__all__.remove('AdvancedOptions')

@@ -307,6 +307,18 @@ except ImportError:
         class ScrubbingOptions:
             def __init__(self, *args, **kwargs) -> None: ...
 
+        class ScrubbingSummaryOptions:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class ScrubbingSummary:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class ScrubbingPatternSummary:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class ScrubbingPathSummary:
+            def __init__(self, *args, **kwargs) -> None: ...
+
         class AdvancedOptions:
             def __init__(self, *args, **kwargs) -> None: ...
 
@@ -331,6 +343,9 @@ except ImportError:
         def logfire_info() -> str:
             """Show versions of logfire, OS and related packages."""
             return 'logfire_info() is not implement by logfire-api'
+
+        def get_scrubbing_summary(*args, **kwargs) -> None:
+            return None
 
         def get_baggage(*args, **kwargs) -> dict[str, str]:
             return {}

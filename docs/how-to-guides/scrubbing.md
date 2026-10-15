@@ -83,6 +83,55 @@ def scrubbing_callback(match: logfire.ScrubMatch):
 logfire.configure(scrubbing=logfire.ScrubbingOptions(callback=scrubbing_callback))
 ```
 
+## Dry runs and hit summaries
+
+A new scrubbing pattern is hard to validate: writing it too broadly wipes out normal fields, while writing it too narrowly lets sensitive data through, and the only feedback is a full deploy-and-observe cycle. To make this safer, the SDK supports **dry-run mode** and a **hit summary**.
+
+### Dry-run mode
+
+Set [`dry_run`][logfire.ScrubbingOptions.dry_run] to `True` to run the scrubber without modifying anything:
+
+```python
+import logfire
+
+logfire.configure(
+    scrubbing=logfire.ScrubbingOptions(
+        extra_patterns=['employee_id'],
+        dry_run=True,
+        summary=logfire.ScrubbingSummaryOptions(),
+    )
+)
+```
+
+In dry-run mode, matched values are left in place and exported normally, exactly as if scrubbing hadn't run. Meanwhile every hit is recorded in the summary (see below), including where it would have been redacted. Once the numbers look right, remove `dry_run=True` to start enforcing the pattern.
+
+If a [`callback`][logfire.ScrubbingOptions.callback] is configured, it is still called in dry-run mode so that hits it would refuse to redact are recorded separately, but its return value never changes the exported data.
+
+### Reading the summary
+
+Pass [`ScrubbingSummaryOptions`][logfire.ScrubbingSummaryOptions] to [`summary`][logfire.ScrubbingOptions.summary] to record hits, in either dry-run or normal mode. Retrieve an immutable snapshot with [`logfire.get_scrubbing_summary()`][logfire.get_scrubbing_summary]:
+
+```python
+import logfire
+
+summary = logfire.get_scrubbing_summary()
+for pattern, pattern_summary in summary.patterns.items():
+    print(pattern, pattern_summary.hits, pattern_summary.redacted, pattern_summary.unchanged)
+    for path, path_summary in pattern_summary.paths.items():
+        print('  ', path, path_summary.hits)
+```
+
+Each [`ScrubbingPatternSummary`][logfire.ScrubbingPatternSummary] reports:
+
+- `hits`: total number of times the pattern matched.
+- `redacted` / `unchanged`: matches that were actually redacted or replaced, versus matches left unchanged because the callback returned the original value. In dry-run mode, `redacted` counts values that *would* have been redacted.
+- `paths`: how hits were distributed across attribute paths (e.g. `('attributes', 'password')`), each with its own [`ScrubbingPathSummary`][logfire.ScrubbingPathSummary].
+- `first_hit` and `last_hit`: timestamps of the first and most recent match.
+
+The summary is bounded by [`max_entries`][logfire.ScrubbingSummaryOptions.max_entries] (the number of `(pattern, path)` entries kept, default 10,000). When it is full, the entry that was hit least recently is discarded (the only supported [`eviction_policy`][logfire.ScrubbingSummaryOptions.eviction_policy], `'drop-oldest'`), and [`dropped_entries`][logfire.ScrubbingSummary.dropped_entries] is incremented. Pattern-level hit counts stay exact regardless; only the per-path breakdown loses detail.
+
+When scrubbing is disabled (`scrubbing=False`) or no `summary` options are configured, no summary is collected and `get_scrubbing_summary()` returns `None`.
+
 ## Security tips
 
 ### Use message templates

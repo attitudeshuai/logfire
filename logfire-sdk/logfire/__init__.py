@@ -24,7 +24,14 @@ from ._internal.config import (
 )
 from ._internal.constants import LevelName
 from ._internal.main import Logfire, LogfireSpan
-from ._internal.scrubbing import ScrubbingOptions, ScrubMatch
+from ._internal.scrubbing import (
+    ScrubbingOptions,
+    ScrubbingPathSummary,
+    ScrubbingPatternSummary,
+    ScrubbingSummary,
+    ScrubbingSummaryOptions,
+    ScrubMatch,
+)
 from ._internal.stack_info import add_non_user_code_prefix
 from ._internal.utils import suppress_instrumentation
 from .integrations.logging import LogfireLoggingHandler
@@ -74,6 +81,7 @@ instrument_mcp = DEFAULT_LOGFIRE_INSTANCE.instrument_mcp
 instrument_claude_agent_sdk = DEFAULT_LOGFIRE_INSTANCE.instrument_claude_agent_sdk
 suppress_scopes = DEFAULT_LOGFIRE_INSTANCE.suppress_scopes
 shutdown = DEFAULT_LOGFIRE_INSTANCE.shutdown
+get_scrubbing_summary = DEFAULT_LOGFIRE_INSTANCE.get_scrubbing_summary
 with_tags = DEFAULT_LOGFIRE_INSTANCE.with_tags
 # with_trace_sample_rate = DEFAULT_LOGFIRE_INSTANCE.with_trace_sample_rate
 with_settings = DEFAULT_LOGFIRE_INSTANCE.with_settings
@@ -195,6 +203,11 @@ __all__ = (
     'no_auto_trace',
     'ScrubMatch',
     'ScrubbingOptions',
+    'ScrubbingSummaryOptions',
+    'ScrubbingSummary',
+    'ScrubbingPatternSummary',
+    'ScrubbingPathSummary',
+    'get_scrubbing_summary',
     'VERSION',
     'add_non_user_code_prefix',
     'suppress_instrumentation',

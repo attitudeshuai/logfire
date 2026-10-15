@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import json
+import pickle
 import re
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,7 +17,13 @@ from opentelemetry.sdk.environment_variables import OTEL_RESOURCE_ATTRIBUTES
 from opentelemetry.trace.propagation import get_current_span
 
 import logfire
-from logfire._internal.scrubbing import DEFAULT_PATTERNS, NoopScrubber, Scrubber
+from logfire._internal.scrubbing import (
+    DEFAULT_PATTERNS,
+    DEFAULT_SCRUBBING_SUMMARY_MAX_ENTRIES,
+    NoopScrubber,
+    Scrubber,
+    ScrubbingSummaryOptions,
+)
 from logfire.testing import TestExporter, TestLogExporter
 
 DEFAULT_PATTERN_EXAMPLES = {
@@ -771,3 +781,372 @@ def test_oauth_token_names_scrubbed(exporter: TestExporter):
             'error': 'invalid token',
         }
     )
+
+
+def test_get_scrubbing_summary_none_by_default(exporter: TestExporter, config_kwargs: dict[str, Any]):
+    logfire.configure(**config_kwargs)
+    assert logfire.get_scrubbing_summary() is None
+    assert Scrubber(None).get_scrubbing_summary() is None
+
+    # Scrubbing disabled entirely also has no summary.
+    logfire.configure(**config_kwargs, scrubbing=False)
+    assert isinstance(logfire.DEFAULT_LOGFIRE_INSTANCE.config.scrubber, NoopScrubber)
+    assert logfire.get_scrubbing_summary() is None
+
+
+def test_scrubbing_summary_enforce_mode(exporter: TestExporter, config_kwargs: dict[str, Any]):
+    logfire.configure(
+        scrubbing=logfire.ScrubbingOptions(summary=logfire.ScrubbingSummaryOptions()),
+        **config_kwargs,
+    )
+    logfire.info('first', password='hunter2', nested={'secret': 'shh'})
+    logfire.info('second', password='hunter3')
+
+    # Redaction semantics are unchanged.
+    attrs = exporter.exported_spans_as_dict(parse_json_attributes=True)[0]['attributes']
+    assert attrs['password'] == "[Scrubbed due to 'password']"
+    assert attrs['nested'] == {'secret': "[Scrubbed due to 'secret']"}
+
+    summary = logfire.get_scrubbing_summary()
+    assert isinstance(summary, logfire.ScrubbingSummary)
+    assert summary.dropped_entries == 0
+    assert summary.max_entries == DEFAULT_SCRUBBING_SUMMARY_MAX_ENTRIES
+    assert summary.eviction_policy == 'drop-oldest'
+    assert set(summary.patterns) == {'password', 'secret'}
+
+    password_summary = summary.patterns['password']
+    assert password_summary.hits == 2
+    assert password_summary.redacted == 2
+    assert password_summary.unchanged == 0
+    assert password_summary.paths == {
+        ('attributes', 'password'): logfire.ScrubbingPathSummary(hits=2, redacted=2, unchanged=0),
+    }
+    assert summary.patterns['secret'].paths == {
+        ('attributes', 'nested', 'secret'): logfire.ScrubbingPathSummary(hits=1, redacted=1, unchanged=0),
+    }
+    assert password_summary.first_hit <= password_summary.last_hit
+    assert password_summary.last_hit >= summary.patterns['secret'].last_hit
+    assert all(pattern.last_hit <= summary.generated_at for pattern in summary.patterns.values())
+
+    # Snapshots are independent: an older snapshot is not mutated by later hits.
+    logfire.info('third', password='hunter4')
+    later_summary = logfire.get_scrubbing_summary()
+    assert later_summary is not None
+    assert password_summary.hits == 2
+    assert later_summary.patterns['password'].hits == 3
+
+
+def test_dry_run_does_not_redact_but_records(exporter: TestExporter, config_kwargs: dict[str, Any]):
+    logfire.configure(
+        scrubbing=logfire.ScrubbingOptions(
+            extra_patterns=['my_pattern'],
+            dry_run=True,
+            summary=logfire.ScrubbingSummaryOptions(),
+        ),
+        **config_kwargs,
+    )
+    with logfire.span('span'):
+        get_current_span().add_event('evt', {'password': 'event-hunter'})
+    logfire.info('hi', password='hunter2', data={'my_pattern': 'custom'}, safe='ok')
+
+    spans = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    span_attrs = spans[0]['attributes']
+    # Event attribute is emitted unchanged in dry-run mode.
+    assert spans[0]['events'][0]['attributes']['password'] == 'event-hunter'
+
+    log_attrs = spans[1]['attributes']
+    assert log_attrs['password'] == 'hunter2'
+    assert log_attrs['data'] == {'my_pattern': 'custom'}
+    assert log_attrs['safe'] == 'ok'
+    assert 'logfire.scrubbed' not in span_attrs
+    assert 'logfire.scrubbed' not in log_attrs
+
+    summary = logfire.get_scrubbing_summary()
+    assert summary is not None
+    assert summary.dropped_entries == 0
+    assert set(summary.patterns) == {'password', 'my_pattern'}
+    assert summary.patterns['password'].redacted == 2
+    assert summary.patterns['password'].unchanged == 0
+    assert summary.patterns['password'].paths == {
+        ('otel_events', 0, 'attributes', 'password'): logfire.ScrubbingPathSummary(1, 1, 0),
+        ('attributes', 'password'): logfire.ScrubbingPathSummary(1, 1, 0),
+    }
+    assert summary.patterns['my_pattern'].paths == {
+        ('attributes', 'data', 'my_pattern'): logfire.ScrubbingPathSummary(1, 1, 0),
+    }
+
+
+def test_dry_run_preserves_message_and_json_string():
+    dry_scrubber = Scrubber(
+        None,
+        dry_run=True,
+        summary_options=ScrubbingSummaryOptions(),
+    )
+
+    # A JSON string with sensitive data inside keeps its exact formatting in dry-run mode,
+    # but hits inside the parsed JSON are still recorded.
+    raw_json = '{"password": "hunter2", "nested": [1, 2]}'
+    result, scrubbed_notes = dry_scrubber.scrub_value(('attributes', 'payload'), raw_json)
+    assert result == raw_json
+    assert scrubbed_notes == []
+    summary = dry_scrubber.get_scrubbing_summary()
+    assert summary is not None
+    assert ('attributes', 'payload', 'password') in summary.patterns['password'].paths
+
+    # The same value in enforce mode is re-serialized with the password redacted.
+    enforce_result, enforce_notes = Scrubber(None).scrub_value(('attributes', 'payload'), raw_json)
+    assert json.loads(enforce_result)['password'] == "[Scrubbed due to 'password']"
+    assert enforce_notes == [{'path': ('attributes', 'payload', 'password'), 'matched_substring': 'password'}]
+
+
+def test_dry_run_message_value_recorded(exporter: TestExporter, config_kwargs: dict[str, Any]):
+    logfire.configure(
+        scrubbing=logfire.ScrubbingOptions(dry_run=True, summary=logfire.ScrubbingSummaryOptions()),
+        **config_kwargs,
+    )
+    logfire.info('User: {user}', user=[{'name': 'John', 'password': 'hunter2'}])
+
+    attrs = exporter.exported_spans_as_dict(parse_json_attributes=True)[0]['attributes']
+    # Neither the message nor the attribute is redacted in dry-run mode.
+    assert attrs['logfire.msg'] == "User: [{'name': 'John', 'password': 'hunter2'}]"
+    assert attrs['user'] == [{'name': 'John', 'password': 'hunter2'}]
+    assert 'logfire.scrubbed' not in attrs
+
+    summary = logfire.get_scrubbing_summary()
+    assert summary is not None
+    assert set(summary.patterns['password'].paths) == {
+        ('message', 'user'),
+        ('attributes', 'user', 0, 'password'),
+    }
+
+
+def test_summary_distinguishes_callback_refusals(exporter: TestExporter, config_kwargs: dict[str, Any]):
+    def callback(match: logfire.ScrubMatch):
+        if match.path[-1] == 'kept_password':
+            # Returning the original value refuses the redaction.
+            return match.value
+        if match.path[-1] == 'replaced_password':
+            return 'a different value'
+        # Returning None accepts the default redaction.
+        return None
+
+    logfire.configure(
+        scrubbing=logfire.ScrubbingOptions(callback=callback, summary=logfire.ScrubbingSummaryOptions()),
+        **config_kwargs,
+    )
+    logfire.info(
+        'hi',
+        kept_password='still here',
+        replaced_password='hunter2',
+        redacted_password='hunter3',
+    )
+
+    attrs = exporter.exported_spans_as_dict()[0]['attributes']
+    assert attrs['kept_password'] == 'still here'
+    assert attrs['replaced_password'] == 'a different value'
+    assert attrs['redacted_password'] == "[Scrubbed due to 'password']"
+
+    summary = logfire.get_scrubbing_summary()
+    assert summary is not None
+    password_summary = summary.patterns['password']
+    assert password_summary.hits == 3
+    assert password_summary.redacted == 2
+    assert password_summary.unchanged == 1
+    assert password_summary.paths == {
+        ('attributes', 'kept_password'): logfire.ScrubbingPathSummary(hits=1, redacted=0, unchanged=1),
+        ('attributes', 'replaced_password'): logfire.ScrubbingPathSummary(hits=1, redacted=1, unchanged=0),
+        ('attributes', 'redacted_password'): logfire.ScrubbingPathSummary(hits=1, redacted=1, unchanged=0),
+    }
+
+
+def test_summary_pattern_attribution():
+    scrubber = Scrubber(['my_custom'], summary_options=ScrubbingSummaryOptions())
+    scrubber.scrub_value(
+        ('attributes',),
+        {
+            'my_custom_key': 'x',
+            'password': 'hunter',
+            'nested': 'a my_custom hit',
+            'upper': 'contains MY_CUSTOM uppercase',
+        },
+    )
+    summary = scrubber.get_scrubbing_summary()
+    assert summary is not None
+    assert {
+        (pattern, path) for pattern, pattern_summary in summary.patterns.items() for path in pattern_summary.paths
+    } == {
+        ('my_custom', ('attributes', 'my_custom_key')),
+        ('password', ('attributes', 'password')),
+        ('my_custom', ('attributes', 'nested')),
+        ('my_custom', ('attributes', 'upper')),
+    }
+
+
+def test_summary_eviction_drops_oldest_entries():
+    scrubber = Scrubber(None, summary_options=ScrubbingSummaryOptions(max_entries=2))
+    for name in ('a_password', 'b_password', 'c_password'):
+        scrubber.scrub_value(('attributes',), {name: 'v'})
+
+    summary = scrubber.get_scrubbing_summary()
+    assert summary is not None
+    assert summary.dropped_entries == 1
+    assert set(summary.patterns['password'].paths) == {
+        ('attributes', 'b_password'),
+        ('attributes', 'c_password'),
+    }
+    # Pattern-level totals stay exact even though one path entry was discarded.
+    assert summary.patterns['password'].hits == 3
+
+    # Hitting `b_password` refreshes it, so inserting `d_password` evicts `c_password` instead.
+    scrubber.scrub_value(('attributes',), {'b_password': 'v2'})
+    scrubber.scrub_value(('attributes',), {'d_password': 'v'})
+    summary = scrubber.get_scrubbing_summary()
+    assert summary is not None
+    assert summary.dropped_entries == 2
+    assert set(summary.patterns['password'].paths) == {
+        ('attributes', 'b_password'),
+        ('attributes', 'd_password'),
+    }
+    # The surviving `b_password` entry kept both of its hits.
+    assert summary.patterns['password'].paths[('attributes', 'b_password')].hits == 2
+    assert summary.patterns['password'].hits == 5
+
+
+def test_summary_records_logs(logs_exporter: TestLogExporter, config_kwargs: dict[str, Any]):
+    config_kwargs['advanced'].log_record_processors = [SimpleLogRecordProcessor(logs_exporter)]
+    logfire.configure(
+        scrubbing=logfire.ScrubbingOptions(summary=logfire.ScrubbingSummaryOptions()),
+        **config_kwargs,
+    )
+    get_logger(__name__).emit(LogRecord(attributes={'password': 'hunter', 'event.name': 'hi'}))
+
+    summary = logfire.get_scrubbing_summary()
+    assert summary is not None
+    assert summary.patterns['password'].paths == {
+        ('attributes', 'password'): logfire.ScrubbingPathSummary(1, 1, 0),
+    }
+
+
+def test_summary_options_validation():
+    options = ScrubbingSummaryOptions()
+    assert options.max_entries == DEFAULT_SCRUBBING_SUMMARY_MAX_ENTRIES
+    assert options.eviction_policy == 'drop-oldest'
+    ScrubbingSummaryOptions(max_entries=1)
+
+    for max_entries in (0, -1):
+        with pytest.raises(ValueError, match='positive integer'):
+            ScrubbingSummaryOptions(max_entries=max_entries)
+    with pytest.raises(TypeError, match='integer'):
+        ScrubbingSummaryOptions(max_entries='10')  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match='integer'):
+        # `bool` is rejected at runtime even though it's a subclass of `int`.
+        ScrubbingSummaryOptions(max_entries=True)
+    with pytest.raises(ValueError, match='eviction policy'):
+        ScrubbingSummaryOptions(eviction_policy='drop-new')  # type: ignore[arg-type]
+
+
+def test_summary_concurrent_scrubbing_and_reading():
+    scrubber = Scrubber(None, summary_options=ScrubbingSummaryOptions(max_entries=4))
+    stop = threading.Event()
+    errors: list[AssertionError] = []
+
+    def reader() -> None:
+        while not stop.is_set():
+            summary = scrubber.get_scrubbing_summary()
+            assert summary is not None
+            try:
+                for pattern in summary.patterns.values():
+                    assert pattern.hits == pattern.redacted + pattern.unchanged
+                    path_hits = 0
+                    for entry in pattern.paths.values():
+                        assert entry.hits == entry.redacted + entry.unchanged
+                        path_hits += entry.hits
+                    assert path_hits <= pattern.hits
+            except AssertionError as exc:
+                errors.append(exc)
+
+    keys = [f'password_{i}' for i in range(6)]
+
+    def writer() -> None:
+        for i in range(100):
+            key = keys[i % len(keys)]
+            scrubber.scrub_value(('attributes',), {key: 'the password is hunter2'})
+
+    reader_thread = threading.Thread(target=reader)
+    reader_thread.start()
+    writer_threads = [threading.Thread(target=writer) for _ in range(4)]
+    for thread in writer_threads:
+        thread.start()
+    for thread in writer_threads:
+        thread.join()
+    stop.set()
+    reader_thread.join()
+
+    assert errors == []
+    summary = scrubber.get_scrubbing_summary()
+    assert summary is not None
+    assert summary.patterns['password'].hits == 400
+    assert len(summary.patterns['password'].paths) <= 4
+    assert summary.dropped_entries > 0
+
+
+def test_summary_commits_one_span_atomically():
+    # A reader must never observe a half-committed span: one `scrub_value` call records
+    # 500 hits atomically, so the pattern total can only be observed as 0 or 500.
+    scrubber = Scrubber(None, summary_options=ScrubbingSummaryOptions())
+    seen: set[int] = set()
+    stop = threading.Event()
+
+    def reader() -> None:
+        while not stop.is_set():
+            summary = scrubber.get_scrubbing_summary()
+            assert summary is not None
+            pattern = summary.patterns.get('password')
+            seen.add(0 if pattern is None else pattern.hits)
+
+    reader_thread = threading.Thread(target=reader)
+    reader_thread.start()
+    time.sleep(0.01)
+    batch = {f'password_{i}': 'hunter2' for i in range(500)}
+    scrubber.scrub_value(('attributes',), batch)
+    stop.set()
+    reader_thread.join()
+
+    assert seen <= {0, 500}
+    summary = scrubber.get_scrubbing_summary()
+    assert summary is not None
+    assert summary.patterns['password'].hits == 500
+
+
+def test_scrubbing_summary_options_serialized_round_trip():
+    from logfire._internal.config import GLOBAL_CONFIG
+    from logfire._internal.integrations.executors import deserialize_config, serialize_config
+
+    logfire.configure(
+        send_to_logfire=False,
+        scrubbing=logfire.ScrubbingOptions(
+            extra_patterns=['my_pattern'],
+            dry_run=True,
+            summary=logfire.ScrubbingSummaryOptions(max_entries=123),
+        ),
+    )
+
+    serialized = serialize_config()
+    assert serialized is not None
+    assert serialized['scrubbing'] == {
+        'callback': None,
+        'extra_patterns': ['my_pattern'],
+        'dry_run': True,
+        'summary': {'max_entries': 123, 'eviction_policy': 'drop-oldest'},
+    }
+
+    GLOBAL_CONFIG._initialized = False  # type: ignore[attr-defined]
+    deserialize_config(pickle.loads(pickle.dumps(serialized)))
+    assert isinstance(GLOBAL_CONFIG.scrubbing, logfire.ScrubbingOptions)
+    assert GLOBAL_CONFIG.scrubbing.dry_run is True
+    assert GLOBAL_CONFIG.scrubbing.extra_patterns == ['my_pattern']
+    assert isinstance(GLOBAL_CONFIG.scrubbing.summary, logfire.ScrubbingSummaryOptions)
+    assert GLOBAL_CONFIG.scrubbing.summary.max_entries == 123
+    assert GLOBAL_CONFIG.scrubbing.summary.eviction_policy == 'drop-oldest'
+
+    logfire.configure(send_to_logfire=False)
