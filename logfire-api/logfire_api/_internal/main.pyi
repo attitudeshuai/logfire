@@ -32,7 +32,7 @@ from .integrations.sqlite3 import SQLite3Connection as SQLite3Connection
 from .integrations.system_metrics import Base as SystemMetricsBase, Config as SystemMetricsConfig
 from .json_encoder import logfire_json_dumps as logfire_json_dumps
 from .json_schema import JsonSchemaProperties as JsonSchemaProperties, attributes_json_schema as attributes_json_schema, attributes_json_schema_properties as attributes_json_schema_properties, create_json_schema as create_json_schema
-from .metrics import ProxyMeterProvider as ProxyMeterProvider
+from .metrics import MetricCardinalityStats as MetricCardinalityStats, ProxyMeterProvider as ProxyMeterProvider
 from .stack_info import get_user_stack_info as get_user_stack_info
 from .tracer import ProxyTracerProvider as ProxyTracerProvider, _ProxyTracer, set_exception_status as set_exception_status
 from .utils import SysExcInfo as SysExcInfo, get_version as get_version, handle_internal_errors as handle_internal_errors, log_internal_error as log_internal_error, uniquify_sequence as uniquify_sequence
@@ -1023,7 +1023,15 @@ class Logfire:
             base: A string indicating the base config dictionary which `config` will be merged with,
                 or `None` for an empty base config.
         """
-    def metric_counter(self, name: str, *, unit: str = '', description: str = '') -> Counter:
+    def metric_counter(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> Counter:
         """Create a counter metric.
 
         A counter is a cumulative metric that represents a single numerical value that only ever goes up.
@@ -1051,7 +1059,15 @@ class Logfire:
         Returns:
             The counter metric.
         """
-    def metric_histogram(self, name: str, *, unit: str = '', description: str = '') -> Histogram:
+    def metric_histogram(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> Histogram:
         """Create a histogram metric.
 
         A histogram is a metric that samples observations (usually things like request durations or response sizes).
@@ -1077,7 +1093,15 @@ class Logfire:
         Returns:
             The histogram metric.
         """
-    def metric_gauge(self, name: str, *, unit: str = '', description: str = '') -> Gauge:
+    def metric_gauge(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> Gauge:
         """Create a gauge metric.
 
         Gauge is a synchronous instrument which can be used to record non-additive measurements.
@@ -1103,7 +1127,15 @@ class Logfire:
         Returns:
             The gauge metric.
         """
-    def metric_up_down_counter(self, name: str, *, unit: str = '', description: str = '') -> UpDownCounter:
+    def metric_up_down_counter(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> UpDownCounter:
         """Create an up-down counter metric.
 
         An up-down counter is a cumulative metric that represents a single numerical value that can be adjusted up or
@@ -1135,7 +1167,16 @@ class Logfire:
         Returns:
             The up-down counter metric.
         """
-    def metric_counter_callback(self, name: str, *, callbacks: Sequence[CallbackT], unit: str = '', description: str = '') -> None:
+    def metric_counter_callback(
+        self,
+        name: str,
+        *,
+        callbacks: Sequence[CallbackT],
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> None:
         """Create a counter metric that uses a callback to collect observations.
 
         The callback is called every 60 seconds in a background thread.
@@ -1176,7 +1217,16 @@ class Logfire:
             unit: The unit of the metric.
             description: The description of the metric.
         """
-    def metric_gauge_callback(self, name: str, callbacks: Sequence[CallbackT], *, unit: str = '', description: str = '') -> None:
+    def metric_gauge_callback(
+        self,
+        name: str,
+        callbacks: Sequence[CallbackT],
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> None:
         """Create a gauge metric that uses a callback to collect observations.
 
         The callback is called every 60 seconds in a background thread.
@@ -1215,7 +1265,16 @@ class Logfire:
             unit: The unit of the metric.
             description: The description of the metric.
         """
-    def metric_up_down_counter_callback(self, name: str, callbacks: Sequence[CallbackT], *, unit: str = '', description: str = '') -> None:
+    def metric_up_down_counter_callback(
+        self,
+        name: str,
+        callbacks: Sequence[CallbackT],
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: Literal['overflow', 'drop'] = 'overflow',
+    ) -> None:
         """Create an up-down counter metric that uses a callback to collect observations.
 
         The callback is called every 60 seconds in a background thread.
@@ -1254,6 +1313,7 @@ class Logfire:
             unit: The unit of the metric.
             description: The description of the metric.
         """
+    def metric_cardinality_stats(self) -> dict[str, MetricCardinalityStats]: ...
     def suppress_scopes(self, *scopes: str) -> None:
         """Prevent spans and metrics from being created for the given OpenTelemetry scope names.
 

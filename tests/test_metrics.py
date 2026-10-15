@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import threading
 from typing import Any
 
 import pytest
@@ -835,4 +837,432 @@ def test_replace_default_views(metrics_reader: InMemoryMetricReader, config_kwar
                 },
             },
         ]
+    )
+
+
+def _get_named_metric(metrics_reader: InMemoryMetricReader, name: str) -> dict[str, Any]:
+    matches = [m for m in get_collected_metrics(metrics_reader) if m['name'] == name]
+    assert len(matches) == 1
+    return matches[0]
+
+
+def _point_attrs_and_values(metrics_reader: InMemoryMetricReader, name: str) -> list[tuple[Any, Any]]:
+    points = _get_named_metric(metrics_reader, name)['data']['data_points']
+    # Gauges/counters use 'value', histograms use 'sum'.
+    return [(point['attributes'], point['value'] if 'value' in point else point['sum']) for point in points]
+
+
+def _sort_points(points: list[tuple[Any, Any]]) -> list[tuple[Any, Any]]:
+    # Attribute values include dicts/lists, which aren't comparable or hashable,
+    # so compare via a canonical JSON key.
+    return sorted(points, key=lambda point: json.dumps(point[0], sort_keys=True))
+
+
+def _point_value(points: list[tuple[Any, Any]], attributes: Any) -> Any:
+    return next(value for attrs, value in points if attrs == attributes)
+
+
+def test_cardinality_limit_overflow_bucket(metrics_reader: InMemoryMetricReader) -> None:
+    counter = logfire.metric_counter('card.overflow_bucket', cardinality_limit=2)
+    counter.add(1, {'user_id': 'a'})
+    counter.add(2, {'user_id': 'a'})  # same combination, not registered again
+    counter.add(3, {'user_id': 'b'})
+    counter.add(4, {'user_id': 'c'})
+    counter.add(5, {'user_id': 'd'})
+
+    stats = logfire.metric_cardinality_stats()['card.overflow_bucket']
+    assert stats == logfire.MetricCardinalityStats(
+        metric_name='card.overflow_bucket',
+        limit=2,
+        overflow_policy='overflow',
+        registered_combinations=2,
+        overflow_measurements=2,
+        dropped_measurements=0,
+    )
+
+    # The two over-limit combinations share one synthetic series which carries
+    # only the reserved overflow attribute, so the backend can tell it apart from
+    # a real label value.
+    assert _sort_points(_point_attrs_and_values(metrics_reader, 'card.overflow_bucket')) == _sort_points(
+        [
+            ({'user_id': 'a'}, 3),
+            ({'user_id': 'b'}, 3),
+            ({'otel.metric.overflow': True}, 9),
+        ]
+    )
+
+
+def test_cardinality_limit_drop(metrics_reader: InMemoryMetricReader) -> None:
+    counter = logfire.metric_counter('card.drop', cardinality_limit=1, overflow_policy='drop')
+    counter.add(1, {'session_id': 'a'})
+    counter.add(2, {'session_id': 'a'})
+    counter.add(3, {'session_id': 'b'})
+    counter.add(4, {'session_id': 'c'})
+
+    stats = logfire.metric_cardinality_stats()['card.drop']
+    assert stats.registered_combinations == 1
+    assert stats.overflow_measurements == 0
+    assert stats.dropped_measurements == 2
+    assert stats.overflow_policy == 'drop'
+
+    assert _point_attrs_and_values(metrics_reader, 'card.drop') == [({'session_id': 'a'}, 3)]
+
+
+def test_cardinality_overflow_is_sticky(metrics_reader: InMemoryMetricReader) -> None:
+    # A combination first seen after the limit is reached keeps going to the
+    # overflow bucket, even if seen again later.
+    counter = logfire.metric_counter('card.sticky', cardinality_limit=1)
+    counter.add(1, {'k': 'a'})
+    counter.add(2, {'k': 'b'})
+    counter.add(3, {'k': 'b'})
+    counter.add(4, {'k': 'b'})
+
+    stats = logfire.metric_cardinality_stats()['card.sticky']
+    assert stats.registered_combinations == 1
+    assert stats.overflow_measurements == 3
+    assert _sort_points(_point_attrs_and_values(metrics_reader, 'card.sticky')) == _sort_points(
+        [({'k': 'a'}, 1), ({'otel.metric.overflow': True}, 9)]
+    )
+
+
+def test_cardinality_limit_without_attributes(metrics_reader: InMemoryMetricReader) -> None:
+    counter = logfire.metric_counter('card.no_attributes', cardinality_limit=1)
+    counter.add(1)
+    counter.add(2, None)
+    counter.add(3, {})
+
+    stats = logfire.metric_cardinality_stats()['card.no_attributes']
+    assert stats.registered_combinations == 1
+    assert stats.overflow_measurements == 0
+    assert _point_attrs_and_values(metrics_reader, 'card.no_attributes') == [({}, 6)]
+
+
+@pytest.mark.parametrize('instrument_kind', ['counter', 'up_down_counter', 'histogram', 'gauge'])
+def test_cardinality_overflow_synchronous_instrument_kinds(
+    metrics_reader: InMemoryMetricReader, instrument_kind: str
+) -> None:
+    if instrument_kind == 'counter':
+        instrument = logfire.metric_counter(f'card.sync.{instrument_kind}', cardinality_limit=2)
+        record = instrument.add
+    elif instrument_kind == 'up_down_counter':
+        instrument = logfire.metric_up_down_counter(f'card.sync.{instrument_kind}', cardinality_limit=2)
+        record = instrument.add
+    elif instrument_kind == 'histogram':
+        instrument = logfire.metric_histogram(f'card.sync.{instrument_kind}', cardinality_limit=2)
+        record = instrument.record
+    else:
+        instrument = logfire.metric_gauge(f'card.sync.{instrument_kind}', cardinality_limit=2)
+        record = instrument.set
+
+    record(1, {'k': 'a'})
+    record(2, {'k': 'b'})
+    record(3, {'k': 'c'})
+    record(4, {'k': 'd'})
+
+    points = _get_named_metric(metrics_reader, f'card.sync.{instrument_kind}')['data']['data_points']
+    by_attributes = {tuple(sorted(point['attributes'].items())): point for point in points}
+    assert set(by_attributes) == {
+        (('k', 'a'),),
+        (('k', 'b'),),
+        (('otel.metric.overflow', True),),
+    }
+    overflow_point = by_attributes[(('otel.metric.overflow', True),)]
+    if instrument_kind == 'gauge':
+        # Last value wins: the overflow series was last set to 4.
+        assert overflow_point['value'] == 4
+        assert by_attributes[(('k', 'a'),)]['value'] == 1
+        assert by_attributes[(('k', 'b'),)]['value'] == 2
+    elif instrument_kind == 'histogram':
+        assert overflow_point['sum'] == 7
+        assert overflow_point['count'] == 2
+        assert by_attributes[(('k', 'a'),)]['sum'] == 1
+        assert by_attributes[(('k', 'b'),)]['sum'] == 2
+    else:
+        assert overflow_point['value'] == 7
+        assert by_attributes[(('k', 'a'),)]['value'] == 1
+        assert by_attributes[(('k', 'b'),)]['value'] == 2
+
+
+@pytest.mark.parametrize('instrument_kind', ['up_down_counter', 'histogram', 'gauge'])
+def test_cardinality_drop_synchronous_instrument_kinds(
+    metrics_reader: InMemoryMetricReader, instrument_kind: str
+) -> None:
+    if instrument_kind == 'up_down_counter':
+        instrument = logfire.metric_up_down_counter(
+            f'card.sync_drop.{instrument_kind}', cardinality_limit=1, overflow_policy='drop'
+        )
+        record = instrument.add
+    elif instrument_kind == 'histogram':
+        instrument = logfire.metric_histogram(
+            f'card.sync_drop.{instrument_kind}', cardinality_limit=1, overflow_policy='drop'
+        )
+        record = instrument.record
+    else:
+        instrument = logfire.metric_gauge(
+            f'card.sync_drop.{instrument_kind}', cardinality_limit=1, overflow_policy='drop'
+        )
+        record = instrument.set
+
+    record(1, {'k': 'a'})
+    record(2, {'k': 'b'})
+    record(3, {'k': 'c'})
+
+    points = _get_named_metric(metrics_reader, f'card.sync_drop.{instrument_kind}')['data']['data_points']
+    assert len(points) == 1
+    assert points[0]['attributes'] == {'k': 'a'}
+    stats = logfire.metric_cardinality_stats()[f'card.sync_drop.{instrument_kind}']
+    assert stats.registered_combinations == 1
+    assert stats.dropped_measurements == 2
+    assert stats.overflow_measurements == 0
+
+
+@pytest.mark.parametrize(
+    ('instrument_kind', 'overflow_policy'),
+    [
+        ('counter', 'overflow'),
+        ('up_down_counter', 'overflow'),
+        ('gauge', 'drop'),
+    ],
+)
+def test_cardinality_governs_observable_callbacks(
+    metrics_reader: InMemoryMetricReader, instrument_kind: str, overflow_policy: str
+) -> None:
+    def callback(options: CallbackOptions):
+        yield Observation(1, {'k': 'a'})
+        yield Observation(2, {'k': 'b'})
+        yield Observation(4, {'k': 'c'})
+
+    name = f'card.observable.{instrument_kind}'
+    if instrument_kind == 'counter':
+        logfire.metric_counter_callback(
+            name,
+            callbacks=[callback],
+            cardinality_limit=1,
+            overflow_policy=overflow_policy,  # type: ignore[arg-type]
+        )
+    elif instrument_kind == 'up_down_counter':
+        logfire.metric_up_down_counter_callback(
+            name,
+            callbacks=[callback],
+            cardinality_limit=1,
+            overflow_policy=overflow_policy,  # type: ignore[arg-type]
+        )
+    else:
+        logfire.metric_gauge_callback(
+            name,
+            [callback],
+            cardinality_limit=1,
+            overflow_policy=overflow_policy,  # type: ignore[arg-type]
+        )
+
+    # `get_collected_metrics` triggers a collection, which invokes the callback.
+    points = _get_named_metric(metrics_reader, name)['data']['data_points']
+    attribute_sets = {tuple(sorted(point['attributes'].items())) for point in points}
+    stats = logfire.metric_cardinality_stats()[name]
+    assert stats.registered_combinations == 1
+    if overflow_policy == 'drop':
+        assert attribute_sets == {(('k', 'a'),)}
+        assert stats.dropped_measurements == 2
+        assert stats.overflow_measurements == 0
+    else:
+        assert attribute_sets == {(('k', 'a'),), (('otel.metric.overflow', True),)}
+        assert stats.overflow_measurements == 2
+        assert stats.dropped_measurements == 0
+
+
+@pytest.mark.parametrize(
+    ('cardinality_limit', 'overflow_policy', 'expected_exception'),
+    [
+        (0, 'overflow', ValueError),
+        (-1, 'overflow', ValueError),
+        ('10', 'overflow', TypeError),
+        (True, 'overflow', TypeError),
+        (1, 'discard', ValueError),
+    ],
+)
+def test_cardinality_invalid_options(
+    cardinality_limit: Any, overflow_policy: str, expected_exception: type[Exception]
+) -> None:
+    with pytest.raises(expected_exception):
+        logfire.metric_counter(
+            f'card.invalid.{cardinality_limit!r}.{overflow_policy}',
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,  # type: ignore[arg-type]
+        )
+
+
+def test_cardinality_stats_are_independent_per_metric(metrics_reader: InMemoryMetricReader) -> None:
+    one = logfire.metric_counter('card.independent_one', cardinality_limit=1)
+    two = logfire.metric_counter('card.independent_two', cardinality_limit=2)
+    unlimited = logfire.metric_counter('card.independent_unlimited')
+
+    one.add(1, {'k': 'a'})
+    one.add(1, {'k': 'b'})
+    two.add(1, {'k': 'a'})
+    two.add(1, {'k': 'b'})
+    two.add(1, {'k': 'c'})
+    for i in range(6):
+        unlimited.add(1, {'k': i})
+
+    stats = logfire.metric_cardinality_stats()
+    assert stats['card.independent_one'].registered_combinations == 1
+    assert stats['card.independent_one'].overflow_measurements == 1
+    assert stats['card.independent_two'].registered_combinations == 2
+    assert stats['card.independent_two'].overflow_measurements == 1
+    # Metrics without a declared limit are not accounted for and keep all series.
+    assert 'card.independent_unlimited' not in stats
+    assert len(_point_attrs_and_values(metrics_reader, 'card.independent_unlimited')) == 6
+
+
+def test_without_cardinality_limit_recording_is_unchanged(metrics_reader: InMemoryMetricReader) -> None:
+    counter = logfire.metric_counter('card.unlimited')
+    for i in range(10):
+        counter.add(i, {'k': i})
+
+    assert 'card.unlimited' not in logfire.metric_cardinality_stats()
+    points = _point_attrs_and_values(metrics_reader, 'card.unlimited')
+    assert _sort_points(points) == _sort_points([({'k': i}, i) for i in range(10)])
+
+
+def test_cardinality_registered_combinations_never_exceed_limit(
+    metrics_reader: InMemoryMetricReader,
+) -> None:
+    # Many more new combinations than the limit: registering a combination must
+    # not require scanning the already registered combinations, and the counters
+    # must stay exact once the cap is reached.
+    counter = logfire.metric_counter('card.capped', cardinality_limit=5)
+    for i in range(2000):
+        counter.add(1, {'k': i})
+
+    stats = logfire.metric_cardinality_stats()['card.capped']
+    assert stats.registered_combinations == 5
+    assert stats.overflow_measurements == 1995
+    points = _point_attrs_and_values(metrics_reader, 'card.capped')
+    assert len(points) == 6  # 5 real combinations + 1 overflow series
+    assert _point_value(points, {'otel.metric.overflow': True}) == 1995
+
+
+def test_cardinality_attribute_key_normalization(metrics_reader: InMemoryMetricReader) -> None:
+    counter = logfire.metric_counter('card.key_normalization', cardinality_limit=5)
+    # Sequence order matters, mapping/dict order does not.
+    counter.add(1, {'tags': ('x', 'y'), 'meta': {'n': 1}})
+    counter.add(1, {'meta': {'n': 1}, 'tags': ('x', 'y')})
+    counter.add(1, {'tags': ('x', 'y')})
+    counter.add(1, {'tags': ('y', 'x')})
+    # `None` values are dropped by OpenTelemetry, but the limiter still treats
+    # the combination as a distinct registered combination.
+    counter.add(1, {'maybe': None})
+    counter.add(1, {})
+
+    stats = logfire.metric_cardinality_stats()['card.key_normalization']
+    assert stats.registered_combinations == 5
+    assert stats.overflow_measurements == 0
+    points = _point_attrs_and_values(metrics_reader, 'card.key_normalization')
+    # Collected metrics go through JSON, where sequences become lists.
+    assert _point_value(points, {'tags': ['x', 'y'], 'meta': {'n': 1}}) == 2  # dict order ignored
+    assert _point_value(points, {'tags': ['x', 'y']}) == 1
+    assert _point_value(points, {'tags': ['y', 'x']}) == 1  # sequence order matters
+    # `None` values are exported as `null`, so this stays its own series.
+    assert _point_value(points, {'maybe': None}) == 1
+    assert _point_value(points, {}) == 1
+
+
+def test_cardinality_concurrent_updates(metrics_reader: InMemoryMetricReader) -> None:
+    limit = 50
+    overflow_counter = logfire.metric_counter('card.concurrent_overflow', cardinality_limit=limit)
+    drop_counter = logfire.metric_counter('card.concurrent_drop', cardinality_limit=limit, overflow_policy='drop')
+
+    n_threads = 8
+    per_thread_unique = 200
+    shared_keys = 10
+    barrier = threading.Barrier(n_threads)
+
+    def worker(thread_id: int) -> None:
+        barrier.wait()
+        for i in range(per_thread_unique):
+            attributes = {'k': f'{thread_id}-{i}'}
+            overflow_counter.add(1, attributes)
+            drop_counter.add(1, attributes)
+        for i in range(shared_keys):
+            attributes = {'shared': i}
+            overflow_counter.add(1, attributes)
+            drop_counter.add(1, attributes)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    total = n_threads * (per_thread_unique + shared_keys)
+    overflow_stats = logfire.metric_cardinality_stats()['card.concurrent_overflow']
+    drop_stats = logfire.metric_cardinality_stats()['card.concurrent_drop']
+
+    # Exactly `limit` combinations win the race per metric, counters never lost.
+    assert overflow_stats.registered_combinations == limit
+    assert drop_stats.registered_combinations == limit
+    # One collection exports every metric at once (and DELTA data is consumed by
+    # the read), so extract both metrics from the same collected batch.
+    collected = get_collected_metrics(metrics_reader)
+
+    def collected_points(metric_name: str) -> list[tuple[Any, Any]]:
+        matches = [metric for metric in collected if metric['name'] == metric_name]
+        assert len(matches) == 1
+        data_points = matches[0]['data']['data_points']
+        return [(point['attributes'], point['value'] if 'value' in point else point['sum']) for point in data_points]
+
+    overflow_points = collected_points('card.concurrent_overflow')
+    drop_points = collected_points('card.concurrent_drop')
+    # Nothing is lost with the overflow bucket: the totals add up exactly.
+    assert sum(value for _, value in overflow_points) == total
+    assert _point_value(overflow_points, {'otel.metric.overflow': True}) == overflow_stats.overflow_measurements
+    # With dropping, recorded points plus the dropped counter add up exactly.
+    assert sum(value for _, value in drop_points) + drop_stats.dropped_measurements == total
+    assert all(attributes != {'otel.metric.overflow': True} for attributes, _ in drop_points)
+    assert overflow_stats.dropped_measurements == 0
+    assert drop_stats.overflow_measurements == 0
+
+
+def test_cardinality_dropped_measurement_still_recorded_in_span(exporter: TestExporter) -> None:
+    # Span metric details mirror the raw measurements; cardinality governance
+    # only protects the metric aggregation pipeline.
+    counter = logfire.metric_counter('card.in_span', cardinality_limit=1, overflow_policy='drop')
+    with logfire.span('cardinality span'):
+        counter.add(1, {'user_id': 'a'})
+        counter.add(2, {'user_id': 'b'})  # dropped from the metric pipeline
+
+    [span] = exporter.exported_spans_as_dict(parse_json_attributes=True)
+    assert span['attributes']['logfire.metrics'] == {
+        'card.in_span': {
+            'details': [
+                {'attributes': {'user_id': 'a'}, 'total': 1},
+                {'attributes': {'user_id': 'b'}, 'total': 2},
+            ],
+            'total': 3,
+        }
+    }
+
+
+def test_cardinality_limiter_survives_reconfigure(
+    metrics_reader: InMemoryMetricReader, config_kwargs: dict[str, Any]
+) -> None:
+    counter = logfire.metric_counter('card.reconfigure', cardinality_limit=1)
+    counter.add(1, {'k': 'a'})
+    counter.add(1, {'k': 'b'})
+    metrics_reader.collect()
+
+    new_reader = InMemoryMetricReader(preferred_temporality=METRICS_PREFERRED_TEMPORALITY)
+    logfire.configure(
+        **config_kwargs,
+        metrics=logfire.MetricsOptions(additional_readers=[new_reader]),
+    )
+
+    counter.add(1, {'k': 'a'})  # still a registered combination
+    counter.add(1, {'k': 'c'})  # still over the limit
+
+    stats = logfire.metric_cardinality_stats()['card.reconfigure']
+    assert stats.registered_combinations == 1
+    assert stats.overflow_measurements == 2
+    assert _sort_points(_point_attrs_and_values(new_reader, 'card.reconfigure')) == _sort_points(
+        [({'k': 'a'}, 1), ({'otel.metric.overflow': True}, 1)]
     )

@@ -24,6 +24,7 @@ from ._internal.config import (
 )
 from ._internal.constants import LevelName
 from ._internal.main import Logfire, LogfireSpan
+from ._internal.metrics import MetricCardinalityStats as MetricCardinalityStats
 from ._internal.scrubbing import ScrubbingOptions, ScrubMatch
 from ._internal.stack_info import add_non_user_code_prefix
 from ._internal.utils import suppress_instrumentation
@@ -101,6 +102,7 @@ metric_gauge = DEFAULT_LOGFIRE_INSTANCE.metric_gauge
 metric_counter_callback = DEFAULT_LOGFIRE_INSTANCE.metric_counter_callback
 metric_gauge_callback = DEFAULT_LOGFIRE_INSTANCE.metric_gauge_callback
 metric_up_down_counter_callback = DEFAULT_LOGFIRE_INSTANCE.metric_up_down_counter_callback
+metric_cardinality_stats = DEFAULT_LOGFIRE_INSTANCE.metric_cardinality_stats
 
 # Variables
 var = DEFAULT_LOGFIRE_INSTANCE.var

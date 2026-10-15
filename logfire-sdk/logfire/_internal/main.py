@@ -59,7 +59,7 @@ from .json_schema import (
     attributes_json_schema_properties,
     create_json_schema,
 )
-from .metrics import ProxyMeterProvider
+from .metrics import MetricCardinalityStats, OverflowPolicy, ProxyMeterProvider
 from .stack_info import get_user_stack_info
 from .tracer import (
     ProxyTracerProvider,
@@ -2307,7 +2307,15 @@ class Logfire:
         self._warn_if_not_initialized_for_instrumentation()
         return instrument_system_metrics(self, config, base)
 
-    def metric_counter(self, name: str, *, unit: str = '', description: str = '') -> Counter:
+    def metric_counter(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
+    ) -> Counter:
         """Create a counter metric.
 
         A counter is a cumulative metric that represents a single numerical value that only ever goes up.
@@ -2331,13 +2339,35 @@ class Logfire:
             name: The name of the metric.
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Measurements with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with measurements whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
 
         Returns:
             The counter metric.
         """
-        return self._meter.create_counter(name, unit, description)
+        return self._meter.create_counter(
+            name,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
 
-    def metric_histogram(self, name: str, *, unit: str = '', description: str = '') -> Histogram:
+    def metric_histogram(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
+    ) -> Histogram:
         """Create a histogram metric.
 
         A histogram is a metric that samples observations (usually things like request durations or response sizes).
@@ -2359,13 +2389,35 @@ class Logfire:
             name: The name of the metric.
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Measurements with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with measurements whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
 
         Returns:
             The histogram metric.
         """
-        return self._meter.create_histogram(name, unit, description)
+        return self._meter.create_histogram(
+            name,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
 
-    def metric_gauge(self, name: str, *, unit: str = '', description: str = '') -> Gauge:
+    def metric_gauge(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
+    ) -> Gauge:
         """Create a gauge metric.
 
         Gauge is a synchronous instrument which can be used to record non-additive measurements.
@@ -2387,13 +2439,35 @@ class Logfire:
             name: The name of the metric.
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Measurements with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with measurements whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
 
         Returns:
             The gauge metric.
         """
-        return self._meter.create_gauge(name, unit, description)
+        return self._meter.create_gauge(
+            name,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
 
-    def metric_up_down_counter(self, name: str, *, unit: str = '', description: str = '') -> UpDownCounter:
+    def metric_up_down_counter(
+        self,
+        name: str,
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
+    ) -> UpDownCounter:
         """Create an up-down counter metric.
 
         An up-down counter is a cumulative metric that represents a single numerical value that can be adjusted up or
@@ -2421,11 +2495,25 @@ class Logfire:
             name: The name of the metric.
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Measurements with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with measurements whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
 
         Returns:
             The up-down counter metric.
         """
-        return self._meter.create_up_down_counter(name, unit, description)
+        return self._meter.create_up_down_counter(
+            name,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
 
     def metric_counter_callback(
         self,
@@ -2434,6 +2522,8 @@ class Logfire:
         callbacks: Sequence[CallbackT],
         unit: str = '',
         description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
     ) -> None:
         """Create a counter metric that uses a callback to collect observations.
 
@@ -2474,11 +2564,33 @@ class Logfire:
                 [Observation](https://opentelemetry-python.readthedocs.io/en/latest/api/metrics.html#opentelemetry.metrics.Observation).
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Observations with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with observations whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
         """
-        self._meter.create_observable_counter(name, callbacks, unit, description)
+        self._meter.create_observable_counter(
+            name,
+            callbacks,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
 
     def metric_gauge_callback(
-        self, name: str, callbacks: Sequence[CallbackT], *, unit: str = '', description: str = ''
+        self,
+        name: str,
+        callbacks: Sequence[CallbackT],
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
     ) -> None:
         """Create a gauge metric that uses a callback to collect observations.
 
@@ -2517,11 +2629,33 @@ class Logfire:
                 [Observation](https://opentelemetry-python.readthedocs.io/en/latest/api/metrics.html#opentelemetry.metrics.Observation).
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Observations with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with observations whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
         """
-        self._meter.create_observable_gauge(name, callbacks, unit, description)
+        self._meter.create_observable_gauge(
+            name,
+            callbacks,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
 
     def metric_up_down_counter_callback(
-        self, name: str, callbacks: Sequence[CallbackT], *, unit: str = '', description: str = ''
+        self,
+        name: str,
+        callbacks: Sequence[CallbackT],
+        *,
+        unit: str = '',
+        description: str = '',
+        cardinality_limit: int | None = None,
+        overflow_policy: OverflowPolicy = 'overflow',
     ) -> None:
         """Create an up-down counter metric that uses a callback to collect observations.
 
@@ -2560,8 +2694,50 @@ class Logfire:
                 [Observation](https://opentelemetry-python.readthedocs.io/en/latest/api/metrics.html#opentelemetry.metrics.Observation).
             unit: The unit of the metric.
             description: The description of the metric.
+            cardinality_limit: The maximum number of distinct attribute combinations recorded as separate
+                time series for this metric. Observations with new combinations once the limit is reached are
+                either merged into a single overflow series or dropped, according to `overflow_policy`.
+                If `None` (the default), there is no limit and recording/export behavior is unchanged.
+            overflow_policy: What to do with observations whose attribute combination is over the limit:
+                `'overflow'` (the default) merges them into one series carrying the attribute
+                `otel.metric.overflow` set to `True`, `'drop'` discards them. Both are counted and queryable
+                at runtime via [`metric_cardinality_stats`][logfire.metric_cardinality_stats].
         """
-        self._meter.create_observable_up_down_counter(name, callbacks, unit, description)
+        self._meter.create_observable_up_down_counter(
+            name,
+            callbacks,
+            unit,
+            description,
+            cardinality_limit=cardinality_limit,
+            overflow_policy=overflow_policy,
+        )
+
+    def metric_cardinality_stats(self) -> dict[str, MetricCardinalityStats]:
+        """Return runtime cardinality governance counters, keyed by metric name.
+
+        Only metrics created with a `cardinality_limit` are included. The counters
+        are independent per metric and updated atomically, so concurrent
+        measurements from multiple threads are counted without lost updates.
+
+        ```py
+        import logfire
+
+        logfire.configure()
+        requests = logfire.metric_counter('requests', cardinality_limit=100)
+
+        # ...later, e.g. in a diagnostics endpoint:
+        stats = logfire.metric_cardinality_stats()['requests']
+        print(stats.registered_combinations, stats.overflow_measurements, stats.dropped_measurements)
+        ```
+
+        Returns:
+            A mapping from metric name to a `MetricCardinalityStats` snapshot.
+        """
+        return {
+            instrument_name: stats
+            for (meter_name, instrument_name), stats in (self._config.get_meter_provider().cardinality_stats().items())
+            if meter_name == self._otel_scope
+        }
 
     def suppress_scopes(self, *scopes: str) -> None:
         """Prevent spans and metrics from being created for the given OpenTelemetry scope names.
