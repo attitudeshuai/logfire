@@ -1578,7 +1578,7 @@ def test_config_serializable():
             # Check that the full set of dataclass fields is known.
             # If a new field appears here, make sure it gets deserialized properly in configure, and tested here.
             assert dataclasses.is_dataclass(getattr(GLOBAL_CONFIG, field.name)) == (
-                field.name in ['console', 'sampling', 'scrubbing', 'advanced', 'code_source', 'variables']
+                field.name in ['console', 'sampling', 'quotas', 'scrubbing', 'advanced', 'code_source', 'variables']
             )
 
         serialized = serialize_config()
@@ -1597,6 +1597,7 @@ def test_config_serializable():
 
         assert isinstance(GLOBAL_CONFIG.console, logfire.ConsoleOptions)
         assert isinstance(GLOBAL_CONFIG.sampling, logfire.SamplingOptions)
+        assert isinstance(GLOBAL_CONFIG.quotas, logfire.QuotaOptions)
         assert isinstance(GLOBAL_CONFIG.scrubbing, logfire.ScrubbingOptions)
         assert isinstance(GLOBAL_CONFIG.advanced, logfire.AdvancedOptions)
         assert isinstance(GLOBAL_CONFIG.advanced.id_generator, SeededRandomIdGenerator)

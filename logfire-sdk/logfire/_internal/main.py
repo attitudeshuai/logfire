@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     from ..integrations.redis import RequestHook as RedisRequestHook, ResponseHook as RedisResponseHook
     from ..integrations.sqlalchemy import CommenterOptions as SQLAlchemyCommenterOptions
     from ..integrations.wsgi import RequestHook as WSGIRequestHook, ResponseHook as WSGIResponseHook
+    from ..quotas import QuotaStats
     from ..variables import (
         ResolveFunction,
         TemplateVariable,
@@ -921,6 +922,19 @@ class Logfire:
             Whether every component that reports a status flushed successfully.
         """
         return self._config.force_flush(timeout_millis)
+
+    def get_quota_stats(self) -> list[QuotaStats]:
+        """Return cumulative per-rule production quota accounting.
+
+        One [`QuotaStats`][logfire.quotas.QuotaStats] is returned per rule declared with
+        [`logfire.configure(quotas=...)`][logfire.configure], in declaration order. The totals are
+        readable at any time and remain available after [`shutdown()`][logfire.shutdown], so the
+        final per-rule totals (allowed, dropped and aggregated records, and number of summary
+        records emitted) are visible at close-out.
+
+        Returns an empty list when no quota rules are configured.
+        """
+        return self._config.get_quota_stats()
 
     def url_from_eval(self, report: EvaluationReport[Any, Any, Any]) -> str | None:
         """Generate a Logfire URL to view an evaluation report.

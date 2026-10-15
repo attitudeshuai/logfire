@@ -14,6 +14,7 @@ from ..integrations.psycopg import CommenterOptions as PsycopgCommenterOptions
 from ..integrations.redis import RequestHook as RedisRequestHook, ResponseHook as RedisResponseHook
 from ..integrations.sqlalchemy import CommenterOptions as SQLAlchemyCommenterOptions
 from ..integrations.wsgi import RequestHook as WSGIRequestHook, ResponseHook as WSGIResponseHook
+from ..quotas import QuotaStats as QuotaStats
 from ..variables import ResolveFunction as ResolveFunction, TemplateVariable as TemplateVariable, ValidationReport as ValidationReport, Variable as Variable, VariablesConfig as VariablesConfig
 from ..version import VERSION as VERSION
 from .auto_trace import AutoTraceModule as AutoTraceModule, install_auto_tracing as install_auto_tracing
@@ -377,6 +378,8 @@ class Logfire:
         Returns:
             Whether every component that reports a status flushed successfully.
         """
+    def get_quota_stats(self) -> list[QuotaStats]:
+        """Return cumulative per-rule production quota accounting."""
     def url_from_eval(self, report: EvaluationReport[Any, Any, Any]) -> str | None:
         """Generate a Logfire URL to view an evaluation report.
 

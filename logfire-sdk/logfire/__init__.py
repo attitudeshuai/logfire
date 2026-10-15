@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from logfire.propagate import attach_context, get_context
+from logfire.quotas import QuotaOptions, QuotaRule
 from logfire.sampling import SamplingOptions
 
 from . import variables as variables
@@ -74,6 +75,7 @@ instrument_mcp = DEFAULT_LOGFIRE_INSTANCE.instrument_mcp
 instrument_claude_agent_sdk = DEFAULT_LOGFIRE_INSTANCE.instrument_claude_agent_sdk
 suppress_scopes = DEFAULT_LOGFIRE_INSTANCE.suppress_scopes
 shutdown = DEFAULT_LOGFIRE_INSTANCE.shutdown
+get_quota_stats = DEFAULT_LOGFIRE_INSTANCE.get_quota_stats
 with_tags = DEFAULT_LOGFIRE_INSTANCE.with_tags
 # with_trace_sample_rate = DEFAULT_LOGFIRE_INSTANCE.with_trace_sample_rate
 with_settings = DEFAULT_LOGFIRE_INSTANCE.with_settings
@@ -192,6 +194,9 @@ __all__ = (
     # 'with_trace_sample_rate',
     'suppress_scopes',
     'shutdown',
+    'get_quota_stats',
+    'QuotaOptions',
+    'QuotaRule',
     'no_auto_trace',
     'ScrubMatch',
     'ScrubbingOptions',

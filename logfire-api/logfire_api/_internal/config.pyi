@@ -34,6 +34,7 @@ from logfire._internal.auth import LOGFIRE_TOKEN_REGION_PATTERN as LOGFIRE_TOKEN
 from logfire._internal.baggage import DirectBaggageAttributesSpanProcessor as DirectBaggageAttributesSpanProcessor
 from logfire._internal.collect_system_info import collect_package_info as collect_package_info
 from logfire.exceptions import LogfireConfigError as LogfireConfigError
+from logfire.quotas import QuotaOptions as QuotaOptions
 from logfire.sampling import SamplingOptions as SamplingOptions
 from logfire.sampling._tail_sampling import TailSamplingProcessor as TailSamplingProcessor
 from logfire.variables import VariablesConfig as VariablesConfig
@@ -143,7 +144,7 @@ class LocalVariablesOptions:
     instrument: bool = ...
     template_mismatch_policy: TemplateMismatchPolicy = ...
 
-def configure(*, local: bool = False, send_to_logfire: bool | Literal['if-token-present'] | None = None, token: str | list[str] | None = None, api_key: str | None = None, service_name: str | None = None, service_version: str | None = None, environment: str | None = None, resource_attributes: Mapping[str, Any] | None = None, console: ConsoleOptions | Literal[False] | None = None, config_dir: Path | str | None = None, data_dir: Path | str | None = None, additional_span_processors: Sequence[SpanProcessor] | None = None, metrics: MetricsOptions | Literal[False] | None = None, scrubbing: ScrubbingOptions | Literal[False] | None = None, inspect_arguments: bool | None = None, sampling: SamplingOptions | None = None, min_level: int | LevelName | None = None, add_baggage_to_attributes: bool = True, code_source: CodeSource | None = None, variables: VariablesOptions | LocalVariablesOptions | None = None, distributed_tracing: bool | None = None, advanced: AdvancedOptions | None = None) -> Logfire:
+def configure(*, local: bool = False, send_to_logfire: bool | Literal['if-token-present'] | None = None, token: str | list[str] | None = None, api_key: str | None = None, service_name: str | None = None, service_version: str | None = None, environment: str | None = None, resource_attributes: Mapping[str, Any] | None = None, console: ConsoleOptions | Literal[False] | None = None, config_dir: Path | str | None = None, data_dir: Path | str | None = None, additional_span_processors: Sequence[SpanProcessor] | None = None, metrics: MetricsOptions | Literal[False] | None = None, scrubbing: ScrubbingOptions | Literal[False] | None = None, inspect_arguments: bool | None = None, sampling: SamplingOptions | None = None, quotas: QuotaOptions | None = None, min_level: int | LevelName | None = None, add_baggage_to_attributes: bool = True, code_source: CodeSource | None = None, variables: VariablesOptions | LocalVariablesOptions | None = None, distributed_tracing: bool | None = None, advanced: AdvancedOptions | None = None) -> Logfire:
     """Configure the logfire SDK.
 
     Args:
@@ -215,6 +216,7 @@ def configure(*, local: bool = False, send_to_logfire: bool | Literal['if-token-
             filtered `logfire.span` context manager.
             If set to `None`, uses the `LOGFIRE_MIN_LEVEL` environment variable; if that is not set, there is no minimum level.
         sampling: Sampling options. See the [sampling guide](https://logfire.pydantic.dev/docs/guides/advanced/sampling/).
+        quotas: Production quota rules that cap spans/logs per time window by span name or log template.
         add_baggage_to_attributes: Set to `False` to prevent OpenTelemetry Baggage from being added to spans as attributes.
             See the [Baggage documentation](https://logfire.pydantic.dev/docs/reference/advanced/baggage/) for more details.
         code_source: Settings for the source code of the project.
@@ -252,6 +254,7 @@ class _LogfireConfigData:
     scrubbing: ScrubbingOptions | Literal[False]
     inspect_arguments: bool
     sampling: SamplingOptions
+    quotas: QuotaOptions
     min_level: int
     add_baggage_to_attributes: bool
     code_source: CodeSource | None

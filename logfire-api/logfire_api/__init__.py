@@ -278,6 +278,10 @@ except ImportError:
         instrument_mcp = DEFAULT_LOGFIRE_INSTANCE.instrument_mcp
         instrument_claude_agent_sdk = DEFAULT_LOGFIRE_INSTANCE.instrument_claude_agent_sdk
         shutdown = DEFAULT_LOGFIRE_INSTANCE.shutdown
+
+        def get_quota_stats(*args, **kwargs) -> list:
+            return []
+
         suppress_scopes = DEFAULT_LOGFIRE_INSTANCE.suppress_scopes
         url_from_eval = DEFAULT_LOGFIRE_INSTANCE.url_from_eval
         forward_export_request = DEFAULT_LOGFIRE_INSTANCE.forward_export_request
@@ -299,6 +303,12 @@ except ImportError:
             def __init__(self, *args, **kwargs) -> None: ...
 
         class SamplingOptions:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class QuotaRule:
+            def __init__(self, *args, **kwargs) -> None: ...
+
+        class QuotaOptions:
             def __init__(self, *args, **kwargs) -> None: ...
 
         class CodeSource:

@@ -72,6 +72,13 @@ from logfire._internal.auth import LOGFIRE_TOKEN_REGION_PATTERN, REGIONS
 from logfire._internal.baggage import DirectBaggageAttributesSpanProcessor
 from logfire._internal.collect_system_info import collect_package_info
 from logfire.exceptions import LogfireConfigError
+from logfire.quotas import QuotaOptions, QuotaStats
+from logfire.quotas._quota import (
+    QuotaEnforcingLogProcessor,
+    QuotaEnforcingSpanProcessor,
+    QuotaManager,
+    coerce_quota_options,
+)
 from logfire.sampling import SamplingOptions
 from logfire.sampling._tail_sampling import TailSamplingProcessor
 from logfire.variables.abstract import NoOpVariableProvider, VariableProvider
@@ -535,6 +542,7 @@ def configure(
     scrubbing: ScrubbingOptions | Literal[False] | None = None,
     inspect_arguments: bool | None = None,
     sampling: SamplingOptions | None = None,
+    quotas: QuotaOptions | None = None,
     min_level: int | LevelName | None = None,
     add_baggage_to_attributes: bool = True,
     code_source: CodeSource | None = None,
@@ -612,7 +620,12 @@ def configure(
             If a span is not created, this has no effect on the current active span, or on logs/spans created inside the
             filtered `logfire.span` context manager.
             If set to `None`, uses the `LOGFIRE_MIN_LEVEL` environment variable; if that is not set, there is no minimum level.
-        sampling: Sampling options. See the [sampling guide](https://logfire.pydantic.dev/docs/guides/advanced/sampling/).
+        sampling: SamplingOptions. See the [sampling guide](https://logfire.pydantic.dev/docs/guides/advanced/sampling/).
+        quotas: Production quota rules that cap how many spans/logs matching given span names or log
+            message templates may be produced per time window. Over-limit records are dropped or
+            folded into a count summary according to each rule. Use
+            [`logfire.get_quota_stats()`][logfire.get_quota_stats] to inspect per-rule accounting at
+            runtime. With no rules configured, production behaviour and overhead are unchanged.
         add_baggage_to_attributes: Set to `False` to prevent OpenTelemetry Baggage from being added to spans as attributes.
             See the [Baggage documentation](https://logfire.pydantic.dev/docs/reference/advanced/baggage/) for more details.
         code_source: Settings for the source code of the project.
@@ -649,6 +662,7 @@ def configure(
             inspect_arguments=inspect_arguments,
             min_level=min_level,
             sampling=sampling,
+            quotas=quotas,
             add_baggage_to_attributes=add_baggage_to_attributes,
             code_source=code_source,
             variables=variables,
@@ -726,6 +740,9 @@ class _LogfireConfigData:
     sampling: SamplingOptions
     """Sampling options."""
 
+    quotas: QuotaOptions
+    """Production quota options."""
+
     min_level: int
     """Minimum log level for logs and spans to be created."""
 
@@ -764,6 +781,7 @@ class _LogfireConfigData:
         scrubbing: ScrubbingOptions | Literal[False] | None,
         inspect_arguments: bool | None,
         sampling: SamplingOptions | None,
+        quotas: QuotaOptions | None,
         min_level: int | LevelName | None,
         add_baggage_to_attributes: bool,
         code_source: CodeSource | None,
@@ -832,6 +850,9 @@ class _LogfireConfigData:
                 head=param_manager.load_param('trace_sample_rate'),
             )
         self.sampling = sampling
+
+        # Dict input comes from `dataclasses.asdict` when forwarding config to process pools.
+        self.quotas = coerce_quota_options(quotas)
 
         if isinstance(code_source, dict):
             # This is particularly for deserializing from a dict as in executors.py
@@ -955,6 +976,7 @@ class LogfireConfig(_LogfireConfigData):
         scrubbing: ScrubbingOptions | Literal[False] | None = None,
         inspect_arguments: bool | None = None,
         sampling: SamplingOptions | None = None,
+        quotas: QuotaOptions | None = None,
         min_level: int | LevelName | None = None,
         add_baggage_to_attributes: bool = True,
         variables: VariablesOptions | None = None,
@@ -986,6 +1008,7 @@ class LogfireConfig(_LogfireConfigData):
             scrubbing=scrubbing,
             inspect_arguments=inspect_arguments,
             sampling=sampling,
+            quotas=quotas,
             min_level=min_level,
             add_baggage_to_attributes=add_baggage_to_attributes,
             code_source=code_source,
@@ -1004,6 +1027,8 @@ class LogfireConfig(_LogfireConfigData):
         _register_at_fork_resource_updates(self._tracer_provider, self._meter_provider, self._logger_provider)
         self._otlp_forwarding = OTLPForwardingManager([])
         self._variables: dict[str, Variable[Any] | TemplateVariable[Any, Any]] = {}
+        # Replaced with a manager built from the configured rules on every `configure()`.
+        self._quota_manager = QuotaManager(())
         # This ensures that we only call OTEL's global set_tracer_provider once to avoid warnings.
         self._has_set_providers = False
         self._initialized = False
@@ -1026,6 +1051,7 @@ class LogfireConfig(_LogfireConfigData):
         scrubbing: ScrubbingOptions | Literal[False] | None,
         inspect_arguments: bool | None,
         sampling: SamplingOptions | None,
+        quotas: QuotaOptions | None,
         min_level: int | LevelName | None,
         add_baggage_to_attributes: bool,
         code_source: CodeSource | None,
@@ -1051,6 +1077,7 @@ class LogfireConfig(_LogfireConfigData):
                 scrubbing,
                 inspect_arguments,
                 sampling,
+                quotas,
                 min_level,
                 add_baggage_to_attributes,
                 code_source,
@@ -1161,6 +1188,11 @@ class LogfireConfig(_LogfireConfigData):
 
         with suppress_instrumentation():
             resource = self._build_resource()
+
+            # Build the quota manager from the configured rules before wiring up either pipeline
+            # so that spans and OTel log records share the same per-rule accounting. With no
+            # rules the manager is disabled and no quota processors are added.
+            self._quota_manager = QuotaManager.from_options(self.quotas)
 
             head = self.sampling.head
             sampler: Sampler | None = None
@@ -1403,6 +1435,15 @@ class LogfireConfig(_LogfireConfigData):
                 for p in deferred_processors:
                     main_multiprocessor.add_span_processor(p)
 
+            if self._quota_manager.enabled:
+                # Inside MainSpanProcessorWrapper (final names, scrubbed attributes) and after
+                # tail sampling (sampled-out traces are not charged to quotas).
+                root_processor = QuotaEnforcingSpanProcessor(
+                    root_processor,
+                    self._quota_manager,
+                    self.advanced.ns_timestamp_generator,
+                )
+
             tracer_provider.add_span_processor(
                 CheckSuppressInstrumentationProcessorWrapper(
                     MainSpanProcessorWrapper(root_processor, self.scrubber),
@@ -1488,8 +1529,15 @@ class LogfireConfig(_LogfireConfigData):
             multi_log_processor = SynchronousMultiLogRecordProcessor()
             for processor in log_record_processors:
                 multi_log_processor.add_log_record_processor(processor)
+            inner_log_processor: LogRecordProcessor = multi_log_processor
+            if self._quota_manager.enabled:
+                inner_log_processor = QuotaEnforcingLogProcessor(
+                    multi_log_processor,
+                    self._quota_manager,
+                    self.advanced.ns_timestamp_generator,
+                )
             root_log_processor = CheckSuppressInstrumentationLogProcessorWrapper(
-                MainLogProcessorWrapper(multi_log_processor, self.scrubber)
+                MainLogProcessorWrapper(inner_log_processor, self.scrubber)
             )
             logger_provider = SDKLoggerProvider(resource)
             logger_provider.add_log_record_processor(root_log_processor)
@@ -1624,6 +1672,16 @@ class LogfireConfig(_LogfireConfigData):
             The logger provider.
         """
         return self._logger_provider
+
+    def get_quota_stats(self) -> list[QuotaStats]:
+        """Return cumulative per-rule production quota accounting, one entry per declared rule.
+
+        The snapshot is readable at any time while the process runs and remains available
+        after `shutdown()`, so the totals for each rule (allowed, dropped and aggregated
+        records plus summary counts) are visible at close-out. Returns an empty list when
+        no quota rules are configured.
+        """
+        return self._quota_manager.stats()
 
     def get_variable_provider(self) -> VariableProvider:
         """Get a variable provider from this `LogfireConfig`.

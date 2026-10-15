@@ -374,6 +374,18 @@ def test_runtime(logfire_api_factory: Callable[[], ModuleType], module_name: str
     logfire_api.SamplingOptions()
     logfire__all__.remove('SamplingOptions')
 
+    assert hasattr(logfire_api, 'QuotaOptions')
+    logfire_api.QuotaOptions()
+    logfire__all__.remove('QuotaOptions')
+
+    assert hasattr(logfire_api, 'QuotaRule')
+    logfire_api.QuotaRule('foo*', 10)
+    logfire__all__.remove('QuotaRule')
+
+    assert hasattr(logfire_api, 'get_quota_stats')
+    assert logfire_api.get_quota_stats() == []
+    logfire__all__.remove('get_quota_stats')
+
     assert hasattr(logfire_api, 'CodeSource')
     logfire_api.CodeSource(repository='https://github.com/pydantic/logfire', revision='main', root_path='test')
     logfire__all__.remove('CodeSource')
